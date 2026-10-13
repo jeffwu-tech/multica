@@ -112,6 +112,9 @@ type Config struct {
 	Profile                        string                // profile name (empty = default)
 	Agents                         map[string]AgentEntry // keyed by provider: claude, codebuddy, codex, copilot, opencode, codearts, deveco, openclaw, hermes, pi, cursor, kimi, reasonix, dsh, kiro, antigravity, qoder, qoderclicn, traecli, grok, qwen, qwenpaw, mcode, dim, zeroclaw (plus built-in runtime identities from agent.BuiltinRuntimes, e.g. omp)
 	WorkspacesRoot                 string                // base path for execution envs (default: ~/multica_workspaces)
+	WorktreeSharePerIssue          bool                  // local_directory worktree mode: every run on one issue, by any agent, works in one persistent worktree on one branch, one run at a time (default: false)
+	WorktreeBranchPrefix           string                // prefix of shared issue branches (default: multica)
+	WorktreeWorkItemPattern        string                // regexp whose first match in the issue title names a shared issue branch, else the issue key (default: \b(?:WI|CS|PRJ)\d{8}\b)
 	KeepEnvAfterTask               bool                  // preserve env after task for debugging
 	HealthPort                     int                   // local HTTP port for health checks (default: 19514)
 	MaxConcurrentTasks             int                   // max tasks running in parallel (default: 20)
@@ -590,6 +593,16 @@ func LoadConfig(overrides Overrides) (Config, error) {
 	gcRepoMaintenanceEnabled := boolFromEnv("MULTICA_GC_REPO_MAINTENANCE_ENABLED", true)
 	gcArtifactPatterns := patternsFromEnv("MULTICA_GC_ARTIFACT_PATTERNS", DefaultGCArtifactPatterns)
 
+	worktreeSharePerIssue := boolFromEnv("MULTICA_WORKTREE_SHARE_PER_ISSUE", false)
+	worktreeBranchPrefix := envOrDefault("MULTICA_WORKTREE_BRANCH_PREFIX", execenv.DefaultWorktreeBranchPrefix)
+	if err := execenv.ValidateBranchPrefix(worktreeBranchPrefix); err != nil {
+		return Config{}, fmt.Errorf("MULTICA_WORKTREE_BRANCH_PREFIX: %w", err)
+	}
+	worktreeWorkItemPattern := envOrDefault("MULTICA_WORKTREE_WORKITEM_PATTERN", execenv.DefaultWorkItemPattern)
+	if err := execenv.ValidateWorkItemPattern(worktreeWorkItemPattern); err != nil {
+		return Config{}, fmt.Errorf("MULTICA_WORKTREE_WORKITEM_PATTERN: %w", err)
+	}
+
 	// Auto-update config: default -> env override -> CLI override.
 	//
 	// Default is opt-in on Multica Cloud (api.multica.ai) and opt-out for
@@ -631,6 +644,9 @@ func LoadConfig(overrides Overrides) (Config, error) {
 		Profile:                         profile,
 		Agents:                          agents,
 		WorkspacesRoot:                  workspacesRoot,
+		WorktreeSharePerIssue:           worktreeSharePerIssue,
+		WorktreeBranchPrefix:            worktreeBranchPrefix,
+		WorktreeWorkItemPattern:         worktreeWorkItemPattern,
 		KeepEnvAfterTask:                keepEnv,
 		GCEnabled:                       gcEnabled,
 		GCInterval:                      gcInterval,

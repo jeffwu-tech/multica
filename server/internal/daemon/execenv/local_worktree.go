@@ -106,11 +106,24 @@ type LocalWorktreeParams struct {
 	WorkspaceID    string
 	AgentID        string
 	ConversationID string
+	// IssueWorktreeRoot, when set, makes every run on the issue — by any agent —
+	// share one persistent worktree under it instead of a disposable one in
+	// EnvRoot. The daemon serialises those runs; see IssueWorktreeRoot.
+	IssueWorktreeRoot string
+	// BranchPrefix, IssueTitle and WorkItemPattern name a shared issue's branch:
+	// <prefix>/<first WorkItemPattern match in IssueTitle, else the issue key>.
+	BranchPrefix    string
+	IssueTitle      string
+	WorkItemPattern string
 }
 
 // owner is the identity a branch created for this task is recorded under.
 func (p LocalWorktreeParams) owner() branchOwner {
-	return branchOwner{WorkspaceID: p.WorkspaceID, AgentID: p.AgentID, ConversationID: p.ConversationID}
+	agentID := p.AgentID
+	if p.IssueWorktreeRoot != "" {
+		agentID = sharedIssueOwnerAgent
+	}
+	return branchOwner{WorkspaceID: p.WorkspaceID, AgentID: agentID, ConversationID: p.ConversationID}
 }
 
 // localWorktreeConversation names the work line a worktree task belongs to, so
@@ -176,6 +189,13 @@ type LocalWorktree struct {
 	// version is right — so this is what the turn's prompt tells it to fix.
 	// Finalize refuses to deliver while any of them are still unmerged.
 	ReplayConflicts []string
+	// Shared marks the issue's persistent worktree under IssueRoot, which
+	// Finalize keeps for the next run instead of removing.
+	Shared    bool
+	IssueRoot string
+	// Reused reports that this run picked up the shared worktree an earlier run
+	// left, rather than creating it.
+	Reused bool
 	// createdBranch records that this prepare put the branch where it is, so
 	// dropping it discards nothing an earlier turn delivered. False for a
 	// continued branch: that one has to survive even a turn that produced
@@ -320,7 +340,11 @@ func PrepareLocalWorktree(params LocalWorktreeParams, logger *slog.Logger) (*Loc
 		return nil, fmt.Errorf("execenv: %q is not inside its repository root %q", localPath, gitRoot)
 	}
 
+	shared := params.IssueWorktreeRoot != ""
 	worktreePath := filepath.Join(params.EnvRoot, localWorktreeDirName)
+	if shared {
+		worktreePath = filepath.Join(params.IssueWorktreeRoot, localWorktreeDirName)
+	}
 
 	// Everything below mutates the repo's worktree admin state or its refs, so
 	// take the per-repo lock first. It covers the stale-path cleanup, which runs
@@ -334,7 +358,7 @@ func PrepareLocalWorktree(params LocalWorktreeParams, logger *slog.Logger) (*Loc
 	}
 	defer unlock()
 
-	if _, statErr := os.Stat(worktreePath); statErr == nil {
+	if _, statErr := os.Stat(worktreePath); statErr == nil && !shared {
 		// Prepare wipes and recreates envRoot, so an existing worktree path
 		// means a stale registration in the user's repo pointing here. Remove
 		// both rather than failing the task.
@@ -378,10 +402,41 @@ func PrepareLocalWorktree(params LocalWorktreeParams, logger *slog.Logger) (*Loc
 			"so the worktree would not match what you have on disk: %w", gitRoot, err)
 	}
 
-	plan := resolveTaskBranch(gitRoot, params, headSHA, logger)
-	actualBranch, createdBranch, err := addLocalWorktree(gitRoot, worktreePath, plan, params.TaskID)
-	if err != nil {
-		return nil, err
+	var (
+		plan             taskBranchPlan
+		reused           bool
+		pendingConflicts []string
+		actualBranch     string
+		createdBranch    bool
+	)
+	if shared {
+		plan, pendingConflicts, reused, err = reuseIssueWorktree(gitRoot, worktreePath, params, logger)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if reused {
+		actualBranch = plan.name
+	} else {
+		plan = resolveTaskBranch(gitRoot, params, headSHA, logger)
+		if shared {
+			if err := os.MkdirAll(params.IssueWorktreeRoot, 0o755); err != nil {
+				return nil, fmt.Errorf("execenv: create issue worktree root: %w", err)
+			}
+			// Claims the readable directory name for this issue before anything else lands in it.
+			if err := writeIssueWorktreeMeta(params.IssueWorktreeRoot, IssueWorktreeMeta{
+				WorkspaceID: params.WorkspaceID,
+				IssueID:     params.ConversationID,
+				GitRoot:     gitRoot,
+				LastUsedAt:  time.Now().UTC(),
+			}); err != nil {
+				return nil, fmt.Errorf("execenv: record the issue worktree: %w", err)
+			}
+		}
+		actualBranch, createdBranch, err = addLocalWorktree(gitRoot, worktreePath, plan, params.TaskID, !shared)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	wt := &LocalWorktree{
@@ -391,6 +446,9 @@ func PrepareLocalWorktree(params LocalWorktreeParams, logger *slog.Logger) (*Loc
 		Branch:        actualBranch,
 		BaseCommit:    plan.base,
 		Continued:     plan.continues,
+		Shared:        shared,
+		IssueRoot:     params.IssueWorktreeRoot,
+		Reused:        reused,
 		createdBranch: createdBranch,
 		userState:     userState,
 		priorState:    plan.priorState,
@@ -408,6 +466,10 @@ func PrepareLocalWorktree(params LocalWorktreeParams, logger *slog.Logger) (*Loc
 	// it because THIS turn could not start would destroy the very thing the
 	// task was meant to build on.
 	rollback := func() {
+		// A reused shared worktree holds earlier runs' state; the next run picks it up.
+		if reused {
+			return
+		}
 		removeLocalWorktreeDir(gitRoot, worktreePath, logger)
 		if createdBranch {
 			dropBranch(gitRoot, actualBranch, logger)
@@ -420,10 +482,29 @@ func PrepareLocalWorktree(params LocalWorktreeParams, logger *slog.Logger) (*Loc
 	// in. A continued branch already carries the snapshot the previous turn
 	// recorded, and the agent's commits sit on top of it, so only what the user
 	// changed after that is new information there.
-	replay, replayErr := replayUserState(worktreePath, plan, userState, logger)
-	if replayErr != nil {
-		rollback()
-		return nil, replayErr
+	//
+	// A reused worktree still mid-merge from an earlier run cannot take another
+	// replay; it is handed over as is and claims no newer snapshot.
+	var replay replayResult
+	if len(pendingConflicts) > 0 {
+		replay.conflicts = pendingConflicts
+		wt.userState = readIssuePendingState(params.IssueWorktreeRoot, gitRoot)
+		if wt.userState == "" {
+			wt.userState = plan.priorState
+		}
+	} else {
+		var replayErr error
+		replay, replayErr = replayUserState(worktreePath, plan, userState, logger)
+		if replayErr != nil {
+			rollback()
+			return nil, replayErr
+		}
+		if shared && len(replay.conflicts) > 0 {
+			if err := writeIssuePendingState(params.IssueWorktreeRoot, userState); err != nil && logger != nil {
+				logger.Warn("execenv: could not record the unresolved replay's snapshot (non-fatal; it is offered again later)",
+					"root", params.IssueWorktreeRoot, "error", err)
+			}
+		}
 	}
 	wt.ReplayConflicts = replay.conflicts
 	// An unresolved merge means the branch does not carry this turn's snapshot
@@ -490,6 +571,19 @@ func PrepareLocalWorktree(params LocalWorktreeParams, logger *slog.Logger) (*Loc
 	// over the worktree before Finalize, so the sidecars are simply gone by the
 	// time anything is committed. That also preserves a genuine agent edit to a
 	// tracked CLAUDE.md, which a blanket exclude would have swallowed.
+
+	if shared {
+		if err := writeIssueWorktreeMeta(params.IssueWorktreeRoot, IssueWorktreeMeta{
+			WorkspaceID: params.WorkspaceID,
+			IssueID:     params.ConversationID,
+			GitRoot:     gitRoot,
+			Branch:      wt.Branch,
+			LastUsedAt:  time.Now().UTC(),
+		}); err != nil && logger != nil {
+			logger.Warn("execenv: could not write the issue worktree record (non-fatal; GC falls back to its age)",
+				"root", params.IssueWorktreeRoot, "error", err)
+		}
+	}
 
 	if logger != nil {
 		logger.Info("execenv: local worktree ready",
@@ -617,7 +711,8 @@ func (w *LocalWorktree) Finalize(logger *slog.Logger) (LocalWorktreeOutcome, err
 	// would take their work with it.
 	tip, err := runGitTrimmed(w.Path, "rev-parse", "--verify", "HEAD")
 	producedWork := err != nil || tip != w.BaseCommit
-	dropped := !producedWork && w.createdBranch
+	// A shared issue worktree outlives a run that only read: the issue is not over.
+	dropped := !producedWork && w.createdBranch && !w.Shared
 
 	// A turn that started mid-merge only gets to advance the branch's recorded
 	// state if it committed something after resolving. When the branch is still
@@ -680,11 +775,30 @@ func (w *LocalWorktree) Finalize(logger *slog.Logger) (LocalWorktreeOutcome, err
 		}
 	}
 
+	if w.Shared && !dropped {
+		clearIssueWorktreeTask(w.IssueRoot, logger)
+		clearIssuePendingState(w.IssueRoot)
+		if logger != nil {
+			logger.Info("execenv: shared issue worktree finalized and kept for the next run",
+				"git_root", w.GitRoot,
+				"path", w.Path,
+				"branch", outcome.Branch,
+				"auto_committed", outcome.AutoCommitted,
+				"produced_work", producedWork,
+			)
+		}
+		return outcome, nil
+	}
+
 	if removeErr := removeLocalWorktreeDir(w.GitRoot, w.Path, logger); removeErr != nil {
 		outcome.PreservedPath = w.Path
 		return outcome, fmt.Errorf(
 			"could not remove finalized worktree for branch %s: %w; the task worktree remains at %s",
 			w.Branch, removeErr, w.Path)
+	}
+	if w.Shared {
+		clearIssueWorktreeTask(w.IssueRoot, logger)
+		clearIssuePendingState(w.IssueRoot)
 	}
 
 	if dropped {
@@ -726,6 +840,19 @@ func (w *LocalWorktree) Discard(logger *slog.Logger) {
 		return
 	}
 	defer unlock()
+	if w.Shared {
+		clearIssueWorktreeTask(w.IssueRoot, logger)
+	}
+	if w.Reused {
+		if logger != nil {
+			logger.Info("execenv: run abandoned before the agent started; shared issue worktree kept",
+				"git_root", w.GitRoot, "path", w.Path, "branch", w.Branch)
+		}
+		return
+	}
+	if w.Shared {
+		clearIssuePendingState(w.IssueRoot)
+	}
 	removeLocalWorktreeDir(w.GitRoot, w.Path, logger)
 	// Same rule as every other teardown: a branch this prepare did not create
 	// belongs to the turns before it and outlives this task.
@@ -1191,6 +1318,15 @@ func resolveTaskBranch(gitRoot string, params LocalWorktreeParams, headSHA strin
 		return taskScoped
 	}
 	preferred := fmt.Sprintf("agent/%s/%s", agentSegment, sanitizeName(params.ConversationKey))
+	if params.IssueWorktreeRoot != "" {
+		// The name is chosen once; a later title edit must not start a new branch.
+		if existing := findOwnedBranch(gitRoot, owner, logger); existing != "" {
+			if plan, ok := planForConversationBranch(gitRoot, existing, headSHA, owner, logger); ok {
+				return plan
+			}
+		}
+		preferred = sharedIssueBranchName(gitRoot, params)
+	}
 	for _, name := range []string{preferred, preferred + "-" + owner.fingerprint()} {
 		plan, ok := planForConversationBranch(gitRoot, name, headSHA, owner, logger)
 		if ok {
@@ -1279,7 +1415,7 @@ func branchOwnedBy(gitRoot, branch string, owner branchOwner, logger *slog.Logge
 // git allows one worktree per branch, and refusing to run is worse than
 // delivering onto a task-scoped branch. It forks from the same base, so the
 // sibling still stands on the conversation's latest work.
-func addLocalWorktree(gitRoot, worktreePath string, plan taskBranchPlan, taskID string) (string, bool, error) {
+func addLocalWorktree(gitRoot, worktreePath string, plan taskBranchPlan, taskID string, allowFork bool) (string, bool, error) {
 	var args []string
 	switch {
 	case plan.continues:
@@ -1297,6 +1433,11 @@ func addLocalWorktree(gitRoot, worktreePath string, plan taskBranchPlan, taskID 
 	}
 	if !branchUnavailable(out) {
 		return "", false, fmt.Errorf("execenv: git worktree add: %s: %w", strings.TrimSpace(out), err)
+	}
+	if !allowFork {
+		return "", false, fmt.Errorf("execenv: branch %s is checked out elsewhere, and this issue's shared worktree needs it; "+
+			"switch that checkout to another branch (see `git worktree list` in %s) and retry: %s",
+			plan.name, gitRoot, strings.TrimSpace(out))
 	}
 	alt := plan.altName(taskID)
 	if out, err := runGit(gitRoot, "worktree", "add", "-b", alt, worktreePath, plan.base); err != nil {

@@ -278,6 +278,9 @@ Daemon behavior is configured via flags or environment variables:
 | Device name | `--device-name` | `MULTICA_DAEMON_DEVICE_NAME` | hostname |
 | Runtime name | `--runtime-name` | `MULTICA_AGENT_RUNTIME_NAME` | `Local Agent` |
 | Workspaces root | — | `MULTICA_WORKSPACES_ROOT` | `~/multica_workspaces` |
+| Shared issue worktree (`local_directory` worktree mode) | — | `MULTICA_WORKTREE_SHARE_PER_ISSUE` | `false` (`true`: every run on an issue, by any agent, works in one persistent worktree on one branch, one run at a time) |
+| Shared issue branch prefix | — | `MULTICA_WORKTREE_BRANCH_PREFIX` | `multica` |
+| Shared issue branch work item pattern | — | `MULTICA_WORKTREE_WORKITEM_PATTERN` | `\b(?:WI\|CS\|PRJ)\d{8}\b` (first match in the issue title names the branch; otherwise the issue key) |
 | GC enabled | — | `MULTICA_GC_ENABLED` | `true` (set `false`/`0` to disable) |
 | GC scan interval | — | `MULTICA_GC_INTERVAL` | `2h` |
 | GC TTL (done/cancelled issues) | — | `MULTICA_GC_TTL` | `24h` |
@@ -389,7 +392,6 @@ Two consequences are worth knowing before debugging a missing MCP tool:
 - **Remote transports depend on what the runtime declares.** ACP v1 requires an omitted capability to be treated as unsupported, so `http` and `sse` entries are dropped with a warning unless the `initialize` response declares `agentCapabilities.mcpCapabilities` with that transport set to true. The built-in Hermes runtime is a verified exception: it declares no `mcpCapabilities` yet accepts both transports, so remote entries are still forwarded to it. That exception covers the Hermes binary only — a custom runtime profile with `protocol_family: hermes` runs a different implementation and keeps the standard rule. Stdio is never gated.
 
 If a configured server produces no tools, check the daemon log for those warnings first, then confirm the runtime itself exposes the server's tools to the model — some ACP adapters apply their own tool-profile filtering after connecting.
-
 
 The daemon launches QwenPaw as `qwenpaw acp --workspace <per-task dir>`. It writes the task brief to `AGENTS.md`, and materialises the run's bound skills into `<per-task dir>/skills/` plus a `skill.json` manifest, so QwenPaw discovers them through its own workspace skill discovery. `acp` and `--workspace` are reserved: `custom_args` cannot override them. QwenPaw is the one runtime with no `MULTICA_QWENPAW_MODEL`: its `session/set_model` writes to a shared, persistent agent config rather than the session, so Multica never sends it a model and leaves that choice to QwenPaw's own configuration.
 

@@ -11,6 +11,8 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+
+	"github.com/multica-ai/multica/server/internal/daemon/execenv"
 )
 
 // localDirectoryResourceType is the project_resource discriminator the daemon
@@ -57,6 +59,32 @@ type localDirectoryAssignment struct {
 // on this rather than on "is there a local_directory assignment at all".
 func (a *localDirectoryAssignment) UsesWorktree() bool {
 	return a != nil && strings.TrimSpace(a.Ref.ExecutionMode) == localDirectoryModeWorktree
+}
+
+// sharedIssueWorktreeRoot returns the persistent worktree root every run on the
+// task's issue shares, or "" when this task runs in a worktree of its own.
+func (d *Daemon) sharedIssueWorktreeRoot(task Task, assignment *localDirectoryAssignment) (string, error) {
+	if !d.cfg.WorktreeSharePerIssue || !assignment.UsesWorktree() || task.IssueID == "" {
+		return "", nil
+	}
+	return execenv.IssueWorktreeRoot(execenv.IssueWorktreeRootParams{
+		WorkspacesRoot:  d.cfg.WorkspacesRoot,
+		WorkspaceID:     task.WorkspaceID,
+		IssueID:         task.IssueID,
+		IssueKey:        task.IssueIdentifier,
+		IssueTitle:      issueTitleForWorktree(task),
+		WorkItemPattern: d.cfg.WorktreeWorkItemPattern,
+		LocalPath:       assignment.AbsPath,
+	})
+}
+
+// issueTitleForWorktree is the issue title a shared worktree is named from.
+func issueTitleForWorktree(task Task) string {
+	if task.IssueTitle == "" && task.AutopilotRunID == "" {
+		// Servers predating issue_title send an issue task's title as its thread name.
+		return task.ThreadName
+	}
+	return task.IssueTitle
 }
 
 // DisplayName is the human-facing name for this directory, safe to render in
@@ -569,6 +597,24 @@ func (l *LocalPathLocker) Acquire(ctx context.Context, realPath, taskID string, 
 		}()
 		return nil, ctx.Err()
 	}
+}
+
+// TryAcquire takes the lock for realPath only if it is free right now.
+func (l *LocalPathLocker) TryAcquire(realPath, holderID string) (func(), bool) {
+	l.mu.Lock()
+	entry, ok := l.locks[realPath]
+	if !ok {
+		entry = &pathLockEntry{}
+		l.locks[realPath] = entry
+	}
+	l.mu.Unlock()
+	if !entry.mu.TryLock() {
+		return nil, false
+	}
+	entry.mu2.Lock()
+	entry.holderID = holderID
+	entry.mu2.Unlock()
+	return l.releaser(realPath, entry), true
 }
 
 // releaser returns the unlock callback. Idempotent via a once flag so a

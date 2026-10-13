@@ -548,6 +548,14 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 		if err := os.MkdirAll(workDir, 0o755); err != nil {
 			return nil, fmt.Errorf("execenv: create worktree workdir %s: %w", workDir, err)
 		}
+		// Written before any sidecar so a run killed mid-prepare is still cleaned up.
+		if localWorktree.Shared {
+			if err := writeIssueWorktreeTask(localWorktree.IssueRoot, issueWorktreeTask{
+				TaskID: params.TaskID, WorkDir: workDir, Provider: params.Provider,
+			}); err != nil {
+				return nil, fmt.Errorf("execenv: record the run in the issue worktree: %w", err)
+			}
+		}
 	}
 
 	env := &Environment{
@@ -587,8 +595,10 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 	// above, and a cloud envRoot is wiped wholesale by the GC — only the
 	// local_directory flow writes into a directory that outlives the task and
 	// belongs to the user, where a leftover marker disables every multica
-	// command in that directory tree until someone removes it by hand.
-	if params.LocalWorkDir != "" {
+	// command in that directory tree until someone removes it by hand. A shared
+	// issue worktree outlives the task too, so it gets the same rollback.
+	sharedWorktree := localWorktree != nil && localWorktree.Shared
+	if params.LocalWorkDir != "" || sharedWorktree {
 		defer func() {
 			if prepareSucceeded {
 				return
@@ -708,10 +718,17 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 		// tree now, while we still hold the in-memory manifest. Elsewhere the
 		// manifest is a convenience the GC can do without, so a warning stays
 		// the right response.
-		if params.LocalWorkDir != "" {
+		if params.LocalWorkDir != "" || sharedWorktree {
 			return nil, fmt.Errorf("execenv: write sidecar manifest: %w", err)
 		}
 		logger.Warn("execenv: write sidecar manifest failed (non-fatal)", "error", err)
+	}
+	if sharedWorktree {
+		if err := writeIssueWorktreeTask(localWorktree.IssueRoot, issueWorktreeTask{
+			TaskID: params.TaskID, WorkDir: workDir, Provider: params.Provider, Sidecars: *manifest,
+		}); err != nil {
+			return nil, fmt.Errorf("execenv: record the run's sidecars in the issue worktree: %w", err)
+		}
 	}
 
 	// For OpenClaw, synthesize a per-task config that pins workspace to

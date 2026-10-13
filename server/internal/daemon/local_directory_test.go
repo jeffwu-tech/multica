@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -845,6 +846,72 @@ func TestAcquireLocalDirectoryLockSkipsWorktreeMode(t *testing.T) {
 	}
 	if got := d.localPathLocks.Holder(assignment.RealPath); got != "" {
 		t.Fatalf("holder = %q, want empty: worktree mode must not lock the path", got)
+	}
+}
+
+// With shared issue worktrees on, runs on one issue queue on its worktree while
+// runs on other issues, and the user's own path, stay free.
+func TestAcquireLocalDirectoryLockQueuesSharedIssueWorktree(t *testing.T) {
+	t.Parallel()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skipf("git is not available: %v", err)
+	}
+
+	const daemonID = "d-mine"
+	repo := createDaemonTestRepo(t)
+	raw, err := json.Marshal(localDirectoryRef{
+		LocalPath:     repo,
+		DaemonID:      daemonID,
+		ExecutionMode: localDirectoryModeWorktree,
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	resources := []ProjectResourceData{
+		{ID: "r1", ResourceType: localDirectoryResourceType, ResourceRef: raw},
+	}
+	d := &Daemon{
+		cfg:            Config{DaemonID: daemonID, WorkspacesRoot: t.TempDir(), WorktreeSharePerIssue: true},
+		localPathLocks: NewLocalPathLocker(),
+		logger:         slog.Default(),
+	}
+	task := func(id, issueID string) Task {
+		return Task{ID: id, WorkspaceID: "ws-1", IssueID: issueID, ProjectResources: resources}
+	}
+
+	release, abort := d.acquireLocalDirectoryLockIfNeeded(context.Background(), task("task-a", "issue-1"), slog.Default())
+	if abort || release == nil {
+		t.Fatalf("first run: abort=%v release=%v; want the issue lock", abort, release != nil)
+	}
+	defer release()
+
+	assignment, err := localDirectoryAssignmentForTask(task("task-a", "issue-1"), daemonID)
+	if err != nil {
+		t.Fatalf("assignment: %v", err)
+	}
+	issueRoot, err := d.sharedIssueWorktreeRoot(task("task-a", "issue-1"), assignment)
+	if err != nil || issueRoot == "" {
+		t.Fatalf("sharedIssueWorktreeRoot = %q, %v", issueRoot, err)
+	}
+	if got := d.localPathLocks.Holder(issueRoot); got != "task-a" {
+		t.Fatalf("issue worktree holder = %q, want task-a", got)
+	}
+	if _, ok := d.localPathLocks.TryAcquire(issueRoot, "task-b"); ok {
+		t.Fatal("a second run on the same issue got the issue worktree")
+	}
+	if got := d.localPathLocks.Holder(assignment.RealPath); got != "" {
+		t.Fatalf("path holder = %q; the user's directory must stay free", got)
+	}
+
+	other, abort := d.acquireLocalDirectoryLockIfNeeded(context.Background(), task("task-c", "issue-2"), slog.Default())
+	if abort || other == nil {
+		t.Fatalf("run on another issue: abort=%v release=%v; want its own lock", abort, other != nil)
+	}
+	other()
+
+	// A task with no issue has no shared worktree and keeps the old behaviour.
+	if none, abort := d.acquireLocalDirectoryLockIfNeeded(context.Background(), task("task-d", ""), slog.Default()); abort || none != nil {
+		t.Fatalf("issue-less run: abort=%v release=%v; want no lock", abort, none != nil)
 	}
 }
 

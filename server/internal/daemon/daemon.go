@@ -6116,19 +6116,39 @@ func (d *Daemon) acquireLocalDirectoryLockIfNeeded(ctx context.Context, task Tas
 	// what lets sibling tasks on one directory run concurrently. Path
 	// validation above still applies — git needs to write worktree
 	// registrations into the user's repo.
+	//
+	// The exception is a shared issue worktree: every run on the issue works in
+	// the same checkout, so they queue on it, exactly like in-place runs queue
+	// on the user's directory.
+	lockKey := assignment.RealPath
 	if assignment.UsesWorktree() {
-		taskLog.Info("local_directory: worktree mode, skipping path mutex")
-		return nil, false
-	}
-
-	// A conversation is not a second writer. Everything above still applied —
-	// the mode was checked, the path was validated, and the assignment stands,
-	// so this task keeps the user's directory as its working directory. Only
-	// the queueing is skipped, which is what stops a chat turn from sitting
-	// behind a 20-minute build with nothing to contribute to it (issue #7344).
-	// See localDirectoryLockExempt for why the mutex does not owe this task a
-	// slot.
-	if localDirectoryLockExempt(task) {
+		issueRoot, rootErr := d.sharedIssueWorktreeRoot(task, assignment)
+		if rootErr != nil {
+			taskLog.Error("local_directory: resolve the issue worktree failed", "error", rootErr)
+			if failErr := d.reportTerminalTask(ctx, terminalTaskReport{
+				kind:          terminalTaskReportFail,
+				taskID:        task.ID,
+				errorMessage:  rootErr.Error(),
+				failureReason: "local_directory_error",
+			}); failErr != nil {
+				taskLog.Error("fail task after issue worktree resolve error", "error", failErr)
+			}
+			return nil, true
+		}
+		if issueRoot == "" {
+			taskLog.Info("local_directory: worktree mode, skipping path mutex")
+			return nil, false
+		}
+		taskLog.Info("local_directory: worktree mode, queueing on the issue's shared worktree", "issue_worktree", issueRoot)
+		lockKey = issueRoot
+	} else if localDirectoryLockExempt(task) {
+		// A conversation is not a second writer. Everything above still applied —
+		// the mode was checked, the path was validated, and the assignment stands,
+		// so this task keeps the user's directory as its working directory. Only
+		// the queueing is skipped, which is what stops a chat turn from sitting
+		// behind a 20-minute build with nothing to contribute to it (issue #7344).
+		// See localDirectoryLockExempt for why the mutex does not owe this task a
+		// slot.
 		taskLog.Info("local_directory: chat task, skipping path mutex")
 		return nil, false
 	}
@@ -6209,7 +6229,7 @@ func (d *Daemon) acquireLocalDirectoryLockIfNeeded(ctx context.Context, task Tas
 			}()
 		})
 	}
-	release, err = d.localPathLocks.Acquire(waitCtx, assignment.RealPath, task.ID, onWait)
+	release, err = d.localPathLocks.Acquire(waitCtx, lockKey, task.ID, onWait)
 	if err != nil {
 		// If the wait was cut short because the server finalized the task
 		// (terminal state) or deleted the row, the row is already in a
@@ -8160,6 +8180,16 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		}
 		if localAssignment.UsesWorktree() {
 			prepParams.LocalWorktree = &execenv.LocalWorktreeParams{LocalPath: localAssignment.AbsPath}
+			issueRoot, rootErr := d.sharedIssueWorktreeRoot(task, localAssignment)
+			if rootErr != nil {
+				return TaskResult{}, asEnvironmentSetupFailure(fmt.Errorf("resolve the issue worktree: %w", rootErr))
+			}
+			if issueRoot != "" {
+				prepParams.LocalWorktree.IssueWorktreeRoot = issueRoot
+				prepParams.LocalWorktree.BranchPrefix = d.cfg.WorktreeBranchPrefix
+				prepParams.LocalWorktree.WorkItemPattern = d.cfg.WorktreeWorkItemPattern
+				prepParams.LocalWorktree.IssueTitle = issueTitleForWorktree(task)
+			}
 			// Take the per-path mutex for the snapshot alone, then hand it
 			// straight back — long enough to read a consistent tree, short
 			// enough that worktree tasks still overlap for the run itself.
