@@ -410,7 +410,7 @@ func PrepareLocalWorktree(params LocalWorktreeParams, logger *slog.Logger) (*Loc
 		createdBranch    bool
 	)
 	if shared {
-		plan, pendingConflicts, reused, err = reuseIssueWorktree(gitRoot, worktreePath, params, logger)
+		plan, pendingConflicts, reused, err = reuseIssueWorktree(gitRoot, worktreePath, headSHA, params, logger)
 		if err != nil {
 			return nil, err
 		}
@@ -539,7 +539,9 @@ func PrepareLocalWorktree(params LocalWorktreeParams, logger *slog.Logger) (*Loc
 		// nothing distinguished it from a branch the user creates there
 		// themselves. And `git diff <baseline>..<branch>` is then the agent's
 		// work on every branch, not only on the ones that started dirty.
-		if dirty || !plan.continues {
+		// A shared issue branch gets no empty baseline: it stays checked out in its
+		// worktree, so the user cannot recreate it under the same name meanwhile.
+		if dirty || (!plan.continues && !shared) {
 			baseline, baseErr := commitBaseline(worktreePath, plan.continues, dirty)
 			if baseErr != nil {
 				// Without a baseline the task cannot tell the user's work from the

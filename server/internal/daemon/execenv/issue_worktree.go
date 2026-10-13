@@ -266,7 +266,7 @@ func registeredWorktreeBranch(gitRoot, worktreePath string) (branch string, regi
 //
 // A worktree still mid-merge is handed over with its conflicts, which are
 // returned so the run's prompt asks the agent to resolve them.
-func reuseIssueWorktree(gitRoot, worktreePath string, params LocalWorktreeParams, logger *slog.Logger) (plan taskBranchPlan, conflicts []string, reused bool, err error) {
+func reuseIssueWorktree(gitRoot, worktreePath, headSHA string, params LocalWorktreeParams, logger *slog.Logger) (plan taskBranchPlan, conflicts []string, reused bool, err error) {
 	if _, statErr := os.Lstat(worktreePath); errors.Is(statErr, fs.ErrNotExist) {
 		return taskBranchPlan{}, nil, false, nil
 	} else if statErr != nil {
@@ -321,12 +321,24 @@ func reuseIssueWorktree(gitRoot, worktreePath string, params LocalWorktreeParams
 				logger.Warn("execenv: committed work an interrupted run left in the issue worktree",
 					"path", worktreePath, "branch", branch)
 			}
-		} else if _, mergedErr := runGit(gitRoot, "merge-base", "--is-ancestor", branch, "HEAD"); mergedErr == nil {
-			// The user merged the branch; start again from their HEAD.
-			if rmErr := removeLocalWorktreeDir(gitRoot, worktreePath, logger); rmErr != nil {
-				return fail("could not remove it to restart the merged branch: %v", rmErr)
+		} else if _, mergedErr := runGit(gitRoot, "merge-base", "--is-ancestor", branch, headSHA); mergedErr == nil {
+			// Everything on the branch is already in the user's HEAD (merged, or no
+			// commits yet): restart it there, in place, rather than re-checking out.
+			if out, resetErr := runGit(worktreePath, "reset", "--hard", headSHA); resetErr != nil {
+				return fail("could not move it to %s: %s", shortID(headSHA), strings.TrimSpace(out))
 			}
-			return taskBranchPlan{}, nil, false, nil
+			if logger != nil {
+				logger.Info("execenv: restarting the issue's shared worktree at the user's HEAD",
+					"path", worktreePath, "branch", branch, "head", headSHA)
+			}
+			return taskBranchPlan{
+				name:           branch,
+				base:           headSHA,
+				reset:          true,
+				conversational: true,
+				tracksState:    true,
+				owner:          owner,
+			}, nil, true, nil
 		}
 	}
 
@@ -547,8 +559,15 @@ func TeardownIssueWorktree(root string, logger *slog.Logger) error {
 					return fmt.Errorf("keeping %s: its uncommitted work could not be committed: %w", worktreePath, err)
 				}
 			}
+			branch, _, _ := registeredWorktreeBranch(meta.GitRoot, worktreePath)
 			if err := removeLocalWorktreeDir(meta.GitRoot, worktreePath, logger); err != nil {
 				return err
+			}
+			// A branch with nothing the user's HEAD lacks carries no work; do not leave it behind.
+			if branch != "" {
+				if _, err := runGit(meta.GitRoot, "merge-base", "--is-ancestor", branch, "HEAD"); err == nil {
+					dropBranch(meta.GitRoot, branch, logger)
+				}
 			}
 		}
 	} else if !errors.Is(err, fs.ErrNotExist) {

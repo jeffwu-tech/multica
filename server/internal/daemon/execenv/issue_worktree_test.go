@@ -198,9 +198,66 @@ func TestSharedIssueWorktreeKeepsAReadOnlyFirstRun(t *testing.T) {
 	if _, err := os.Stat(first.Path); err != nil {
 		t.Errorf("worktree of a read-only first run removed: %v", err)
 	}
+	if extra := gitRun(t, repo, "rev-list", "main..JWU/WI00123456"); extra != "" {
+		t.Errorf("read-only run left commits on the shared branch: %s", extra)
+	}
 	second := mustPrepareShared(t, repo, issueRoot, "agent-b", turnTwoTask, workItemTitle)
 	if !second.Reused || second.Branch != "JWU/WI00123456" {
 		t.Errorf("second run: reused=%v branch=%q; want the kept worktree", second.Reused, second.Branch)
+	}
+}
+
+// A branch with nothing beyond the user's HEAD restarts at their newer HEAD in
+// the same worktree, with no empty commit and no fresh checkout.
+func TestSharedIssueWorktreeFollowsTheUserHeadWhileTheBranchIsEmpty(t *testing.T) {
+	t.Parallel()
+	repo := newTestRepo(t)
+	issueRoot := filepath.Join(t.TempDir(), "issue")
+
+	first := mustPrepareShared(t, repo, issueRoot, "agent-a", turnOneTask, workItemTitle)
+	finalizeOK(t, first)
+	marker := filepath.Join(first.Path, ".git")
+	before, err := os.Stat(marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	writeFile(t, filepath.Join(repo, "upstream.txt"), "new on main\n")
+	gitRun(t, repo, "add", "-A")
+	gitRun(t, repo, "commit", "-m", "user moves on")
+	head := gitRun(t, repo, "rev-parse", "HEAD")
+
+	second := mustPrepareShared(t, repo, issueRoot, "agent-b", turnTwoTask, workItemTitle)
+	if !second.Reused {
+		t.Fatal("worktree was rebuilt instead of reused")
+	}
+	if after, err := os.Stat(marker); err != nil || !os.SameFile(before, after) {
+		t.Errorf("worktree was checked out again (err=%v)", err)
+	}
+	if got := gitRun(t, repo, "rev-parse", "JWU/WI00123456"); got != head {
+		t.Errorf("branch at %s, want the user's HEAD %s with no commit of its own", got, head)
+	}
+	if _, err := os.Stat(filepath.Join(second.WorkDir, "upstream.txt")); err != nil {
+		t.Errorf("worktree does not carry the user's new commit: %v", err)
+	}
+	finalizeOK(t, second)
+	if extra := gitRun(t, repo, "rev-list", "main..JWU/WI00123456"); extra != "" {
+		t.Errorf("empty commits on the shared branch: %s", extra)
+	}
+}
+
+func TestTeardownIssueWorktreeDropsABranchWithoutWork(t *testing.T) {
+	t.Parallel()
+	repo := newTestRepo(t)
+	issueRoot := filepath.Join(t.TempDir(), "issue")
+
+	wt := mustPrepareShared(t, repo, issueRoot, "agent-a", turnOneTask, workItemTitle)
+	finalizeOK(t, wt)
+	if err := TeardownIssueWorktree(issueRoot, worktreeTestLogger()); err != nil {
+		t.Fatalf("TeardownIssueWorktree: %v", err)
+	}
+	if _, err := gitTry(t, repo, "rev-parse", "--verify", wt.Branch); err == nil {
+		t.Errorf("branch %s without work survived teardown", wt.Branch)
 	}
 }
 
