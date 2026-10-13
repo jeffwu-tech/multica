@@ -629,10 +629,10 @@ func TestClaimTaskByRuntime_PopulatesWorkspaceContext(t *testing.T) {
 	runtimeID := createClaimReclaimRuntime(t, ctx, "Workspace context claim runtime")
 	agentID, issueID := createClaimReclaimAgentAndIssue(t, ctx, runtimeID, "Workspace context claim agent")
 	taskID := createDispatchedClaimFixtureTask(t, ctx, agentID, runtimeID, issueID, "120 seconds", false)
-	var workspaceSlug, issuePrefix string
+	var workspaceSlug, issuePrefix, issueTitle string
 	var issueNumber int32
 	dbfx.QueryRow(t, `SELECT slug, issue_prefix FROM workspace WHERE id = $1`, testWorkspaceID).Scan(&workspaceSlug, &issuePrefix)
-	dbfx.QueryRow(t, `SELECT number FROM issue WHERE id = $1`, issueID).Scan(&issueNumber)
+	dbfx.QueryRow(t, `SELECT number, title FROM issue WHERE id = $1`, issueID).Scan(&issueNumber, &issueTitle)
 
 	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/tasks/claim", nil,
 		testWorkspaceID, "workspace-context-claim")
@@ -645,6 +645,7 @@ func TestClaimTaskByRuntime_PopulatesWorkspaceContext(t *testing.T) {
 			WorkspaceContext string `json:"workspace_context"`
 			WorkspaceSlug    string `json:"workspace_slug"`
 			IssueIdentifier  string `json:"issue_identifier"`
+			IssueTitle       string `json:"issue_title"`
 		} `json:"task"`
 	}
 	w.JSON(&resp)
@@ -662,6 +663,9 @@ func TestClaimTaskByRuntime_PopulatesWorkspaceContext(t *testing.T) {
 	}
 	if want := service.IssueIdentifier(issuePrefix, issueNumber); resp.Task.IssueIdentifier != want {
 		t.Errorf("issue_identifier = %q, want %q", resp.Task.IssueIdentifier, want)
+	}
+	if issueTitle == "" || resp.Task.IssueTitle != issueTitle {
+		t.Errorf("issue_title = %q, want %q", resp.Task.IssueTitle, issueTitle)
 	}
 }
 
