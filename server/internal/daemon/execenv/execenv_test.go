@@ -2830,6 +2830,48 @@ func TestPrepareCodexHomeSeedsFromShared(t *testing.T) {
 	}
 }
 
+func TestPrepareCodexHomeCopiesCredentialsPrivately(t *testing.T) {
+	// Cannot use t.Parallel() with t.Setenv.
+
+	sharedHome := t.TempDir()
+	sharedCreds := filepath.Join(sharedHome, ".credentials.json")
+	if err := os.WriteFile(sharedCreds, []byte(`{"mcp":"token"}`), 0o600); err != nil {
+		t.Fatalf("write shared credentials: %v", err)
+	}
+	t.Setenv("CODEX_HOME", sharedHome)
+
+	codexHome := filepath.Join(t.TempDir(), "codex-home")
+	if err := prepareCodexHome(codexHome, testLogger()); err != nil {
+		t.Fatalf("prepareCodexHome failed: %v", err)
+	}
+
+	credsPath := filepath.Join(codexHome, ".credentials.json")
+	fi, err := os.Lstat(credsPath)
+	if err != nil {
+		t.Fatalf(".credentials.json not copied: %v", err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		t.Error(".credentials.json should be a copy, not a symlink")
+	}
+	if runtime.GOOS != "windows" && fi.Mode().Perm() != 0o600 {
+		t.Errorf(".credentials.json mode = %v, want 0600", fi.Mode().Perm())
+	}
+	if data, _ := os.ReadFile(credsPath); string(data) != `{"mcp":"token"}` {
+		t.Errorf(".credentials.json content = %q", data)
+	}
+
+	// Removing the shared file removes the per-task copy on the next prepare.
+	if err := os.Remove(sharedCreds); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareCodexHome(codexHome, testLogger()); err != nil {
+		t.Fatalf("prepareCodexHome (reuse) failed: %v", err)
+	}
+	if _, err := os.Lstat(credsPath); !os.IsNotExist(err) {
+		t.Errorf("stale .credentials.json kept after the shared file was removed: %v", err)
+	}
+}
+
 func TestPrepareCodexHomeCopiesRelativeModelCatalog(t *testing.T) {
 	// Cannot use t.Parallel() with t.Setenv.
 

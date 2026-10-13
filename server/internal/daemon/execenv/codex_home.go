@@ -27,7 +27,11 @@ var codexCopiedFiles = []string{
 	"config.json",
 	"config.toml",
 	"instructions.md",
+	codexCredentialsFile,
 }
+
+// codexCredentialsFile holds Codex's file-backed MCP OAuth credentials.
+const codexCredentialsFile = ".credentials.json"
 
 const (
 	codexModelsCacheFile        = "models_cache.json"
@@ -236,7 +240,11 @@ func prepareCodexHomeWithOpts(codexHome string, opts CodexHomeOptions, logger *s
 	for _, name := range codexCopiedFiles {
 		src := filepath.Join(sharedHome, name)
 		dst := filepath.Join(codexHome, name)
-		if err := syncCopiedFile(src, dst); err != nil {
+		perm := os.FileMode(0o644)
+		if name == codexCredentialsFile {
+			perm = 0o600
+		}
+		if err := syncCopiedFile(src, dst, perm); err != nil {
 			logger.Warn("execenv: codex-home sync failed", "file", name, "error", err)
 			if name == "config.toml" {
 				configSyncErr = err
@@ -1350,7 +1358,7 @@ func logCodexAuthState(authPath string, logger *slog.Logger) {
 // exists in the shared config. For config.json / instructions.md there is
 // no daemon-managed default, so they simply disappear in lockstep with the
 // shared source.
-func syncCopiedFile(src, dst string) error {
+func syncCopiedFile(src, dst string, perm os.FileMode) error {
 	_, srcErr := os.Stat(src)
 	srcMissing := os.IsNotExist(srcErr)
 	if srcErr != nil && !srcMissing {
@@ -1366,7 +1374,7 @@ func syncCopiedFile(src, dst string) error {
 	if srcMissing {
 		return nil
 	}
-	return copyFile(src, dst)
+	return copyFileMode(src, dst, perm)
 }
 
 // seedCopiedFile copies src only when dst has no task-local regular file.
@@ -1396,13 +1404,17 @@ func seedCopiedFile(src, dst string) error {
 
 // copyFile copies src to dst unconditionally.
 func copyFile(src, dst string) error {
+	return copyFileMode(src, dst, 0o644)
+}
+
+func copyFileMode(src, dst string, perm os.FileMode) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return fmt.Errorf("open %s: %w", src, err)
 	}
 	defer in.Close()
 
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
 	if err != nil {
 		return fmt.Errorf("create %s: %w", dst, err)
 	}
