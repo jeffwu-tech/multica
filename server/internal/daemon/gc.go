@@ -75,6 +75,7 @@ type gcStats struct {
 	hermesMemoryStoresReclaimed   int            // per-agent Hermes memory stores reclaimed past their TTL
 	hermesSessionStoresReclaimed  int            // per-conversation Hermes session stores reclaimed past their TTL
 	repoCachesReclaimed           int            // bare repo caches under .repos evicted past their TTL
+	issueWorktreesReclaimed       int            // shared issue worktrees under .issue-worktrees removed once their issue finished
 	taskTempDirsReclaimed         int            // per-task temp dirs under the temp base reclaimed after their owning execution ended
 	taskRootIndexEntriesReclaimed int            // abandoned stable-root records and unpublished entries reclaimed past the orphan TTL
 	bytesReclaimed                int64          // total bytes freed in this cycle
@@ -134,6 +135,10 @@ func (d *Daemon) runGC(ctx context.Context) {
 	// and are never reclaimed by the task walk above.
 	d.pruneRepoWorktreesContext(ctx, root, stats)
 
+	// Shared issue worktrees outlive every task env root by design, so they are
+	// reclaimed against their issue here.
+	d.gcIssueWorktrees(ctx, stats)
+
 	// Reclaim per-issue Codex session stores idle past their TTL. These live
 	// under the shared ~/.codex home (outside WorkspacesRoot) so resume survives
 	// the task GC, which means they need their own bounded lifecycle (MUL-4424).
@@ -174,7 +179,7 @@ func (d *Daemon) runGC(ctx context.Context) {
 		}
 	}
 
-	if stats.cleaned > 0 || stats.orphaned > 0 || stats.artifactDirs > 0 || stats.storesReclaimed > 0 || stats.hermesMemoryStoresReclaimed > 0 || stats.hermesSessionStoresReclaimed > 0 || stats.repoCachesReclaimed > 0 || stats.taskTempDirsReclaimed > 0 || stats.taskRootIndexEntriesReclaimed > 0 {
+	if stats.cleaned > 0 || stats.orphaned > 0 || stats.artifactDirs > 0 || stats.storesReclaimed > 0 || stats.hermesMemoryStoresReclaimed > 0 || stats.hermesSessionStoresReclaimed > 0 || stats.repoCachesReclaimed > 0 || stats.issueWorktreesReclaimed > 0 || stats.taskTempDirsReclaimed > 0 || stats.taskRootIndexEntriesReclaimed > 0 {
 		d.logger.Info("gc: cycle complete",
 			"cleaned", stats.cleaned,
 			"orphaned", stats.orphaned,
@@ -185,6 +190,7 @@ func (d *Daemon) runGC(ctx context.Context) {
 			"hermes_memory_stores_reclaimed", stats.hermesMemoryStoresReclaimed,
 			"hermes_session_stores_reclaimed", stats.hermesSessionStoresReclaimed,
 			"repo_caches_reclaimed", stats.repoCachesReclaimed,
+			"issue_worktrees_reclaimed", stats.issueWorktreesReclaimed,
 			"task_temp_dirs_reclaimed", stats.taskTempDirsReclaimed,
 			"task_root_index_entries_reclaimed", stats.taskRootIndexEntriesReclaimed,
 			"bytes_reclaimed", stats.bytesReclaimed,
@@ -247,6 +253,88 @@ func (d *Daemon) gcWorkspace(ctx context.Context, wsDir string, stats *gcStats) 
 }
 
 const issueGCBatchSize = 500
+
+// gcIssueWorktrees removes a shared issue worktree once its issue has been done
+// or cancelled for GCTTL, or once the issue is gone and the worktree has sat
+// unused for GCOrphanTTL. Work still in the worktree is committed to the issue
+// branch first; a worktree a run currently holds is skipped.
+func (d *Daemon) gcIssueWorktrees(ctx context.Context, stats *gcStats) {
+	if d.client == nil || d.localPathLocks == nil {
+		return
+	}
+	entries, err := execenv.ListIssueWorktrees(d.cfg.WorkspacesRoot)
+	if err != nil {
+		d.logger.Warn("gc: list issue worktrees failed", "error", err)
+		return
+	}
+	byWorkspace := make(map[string][]execenv.IssueWorktreeEntry)
+	for _, entry := range entries {
+		if entry.Meta == nil || entry.Meta.WorkspaceID == "" || entry.Meta.IssueID == "" {
+			// No record means a prepare that died before writing one.
+			if !entry.ModTime.IsZero() && time.Since(entry.ModTime) > d.cfg.GCOrphanTTL {
+				d.reclaimIssueWorktree(entry.Root, "no record", stats)
+			}
+			continue
+		}
+		byWorkspace[entry.Meta.WorkspaceID] = append(byWorkspace[entry.Meta.WorkspaceID], entry)
+	}
+	for workspaceID, items := range byWorkspace {
+		issueIDs := make([]string, 0, len(items))
+		seen := make(map[string]struct{}, len(items))
+		for _, item := range items {
+			if _, ok := seen[item.Meta.IssueID]; !ok {
+				seen[item.Meta.IssueID] = struct{}{}
+				issueIDs = append(issueIDs, item.Meta.IssueID)
+			}
+		}
+		results := make(map[string]IssueGCCheckResult, len(issueIDs))
+		for start := 0; start < len(issueIDs); start += issueGCBatchSize {
+			if ctx.Err() != nil {
+				return
+			}
+			end := min(start+issueGCBatchSize, len(issueIDs))
+			chunk, err := d.client.GetIssueGCChecks(ctx, workspaceID, issueIDs[start:end])
+			if err != nil {
+				d.logger.Warn("gc: issue worktree check failed", "workspace", workspaceID, "error", err)
+				continue
+			}
+			for id, result := range chunk {
+				results[id] = result
+			}
+		}
+		for _, item := range items {
+			result, ok := results[item.Meta.IssueID]
+			if !ok || result.Err != nil {
+				continue
+			}
+			if !result.Found {
+				if time.Since(item.Meta.LastUsedAt) > d.cfg.GCOrphanTTL {
+					d.reclaimIssueWorktree(item.Root, "issue not accessible", stats)
+				}
+				continue
+			}
+			if terminal, _ := issueGCLifecycle(result); terminal && time.Since(result.UpdatedAt) > d.cfg.GCTTL {
+				d.reclaimIssueWorktree(item.Root, "issue "+result.Status, stats)
+			}
+		}
+	}
+}
+
+func (d *Daemon) reclaimIssueWorktree(root, reason string, stats *gcStats) {
+	release, ok := d.localPathLocks.TryAcquire(root, "gc")
+	if !ok {
+		stats.skipped++
+		return
+	}
+	defer release()
+	if err := execenv.TeardownIssueWorktree(root, d.logger); err != nil {
+		d.logger.Warn("gc: issue worktree kept", "root", root, "reason", reason, "error", err)
+		stats.skipped++
+		return
+	}
+	stats.issueWorktreesReclaimed++
+	d.logger.Info("gc: issue worktree reclaimed", "root", root, "reason", reason)
+}
 
 type issueGCCandidate struct {
 	taskDir string

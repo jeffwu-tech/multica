@@ -217,6 +217,79 @@ func TestRunGC_MixedLayoutsUseMetadataWorkspaceIdentity(t *testing.T) {
 	}
 }
 
+func TestRunGC_ReclaimsTheSharedWorktreeOfAFinishedIssue(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skipf("git is not available: %v", err)
+	}
+	const (
+		workspaceID = "a05b0e10-ee7a-4603-a72d-a548b2390cb2"
+		doneIssue   = "11111111-1111-1111-1111-111111111111"
+		openIssue   = "22222222-2222-2222-2222-222222222222"
+	)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/daemon/workspaces/"+workspaceID+"/issues/gc-check", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			IssueIDs []string `json:"issue_ids"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode batch request: %v", err)
+		}
+		issues := make([]map[string]any, 0, len(body.IssueIDs))
+		for _, issueID := range body.IssueIDs {
+			status := "in_progress"
+			if issueID == doneIssue {
+				status = "done"
+			}
+			issues = append(issues, map[string]any{
+				"id": issueID, "found": true, "status": status,
+				"updated_at": time.Now().Add(-10 * 24 * time.Hour),
+			})
+		}
+		json.NewEncoder(w).Encode(map[string]any{"issues": issues})
+	})
+	d := newGCTestDaemon(t, mux)
+	repo := createDaemonTestRepo(t)
+
+	prepare := func(issueID, taskID string) *execenv.LocalWorktree {
+		t.Helper()
+		root, err := execenv.IssueWorktreeRoot(execenv.IssueWorktreeRootParams{
+			WorkspacesRoot: d.cfg.WorkspacesRoot, WorkspaceID: workspaceID, IssueID: issueID, LocalPath: repo,
+		})
+		if err != nil {
+			t.Fatalf("IssueWorktreeRoot: %v", err)
+		}
+		wt, err := execenv.PrepareLocalWorktree(execenv.LocalWorktreeParams{
+			LocalPath: repo, EnvRoot: t.TempDir(), AgentName: "agent", TaskID: taskID,
+			ConversationKey: issueID, WorkspaceID: workspaceID, AgentID: "agent-1", ConversationID: issueID,
+			IssueWorktreeRoot: root,
+		}, slog.Default())
+		if err != nil {
+			t.Fatalf("PrepareLocalWorktree(%s): %v", issueID, err)
+		}
+		if err := os.WriteFile(filepath.Join(wt.WorkDir, "work.txt"), []byte(issueID), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := wt.Finalize(slog.Default()); err != nil {
+			t.Fatalf("Finalize(%s): %v", issueID, err)
+		}
+		return wt
+	}
+	done := prepare(doneIssue, "33333333-3333-3333-3333-333333333333")
+	open := prepare(openIssue, "44444444-4444-4444-4444-444444444444")
+
+	d.runGC(context.Background())
+
+	if _, err := os.Stat(done.IssueRoot); !os.IsNotExist(err) {
+		t.Errorf("done issue's worktree kept: %v", err)
+	}
+	if _, err := os.Stat(open.Path); err != nil {
+		t.Errorf("open issue's worktree reclaimed: %v", err)
+	}
+	if out, err := exec.Command("git", "-C", repo, "rev-parse", "--verify", done.Branch).CombinedOutput(); err != nil {
+		t.Errorf("done issue's branch lost with its worktree: %s", out)
+	}
+}
+
 func TestRunGC_PrunesOnlyTerminalAbandonedTaskRootRecords(t *testing.T) {
 	t.Parallel()
 
