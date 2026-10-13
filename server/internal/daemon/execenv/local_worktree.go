@@ -46,8 +46,8 @@ const (
 	// gitTimeout bounds every git invocation this file makes. These are all
 	// local-only operations (no network), so a slow one means a wedged index
 	// lock rather than a slow remote; failing the task beats hanging a daemon
-	// slot forever.
-	gitTimeout = 2 * time.Minute
+	// slot forever. Large repos (250k+ files) need far longer than 2m to check out.
+	gitTimeout = 30 * time.Minute
 
 	// maxUntrackedFiles / maxUntrackedBytes bound the untracked content a task
 	// will replay. `--exclude-standard` already drops anything gitignored

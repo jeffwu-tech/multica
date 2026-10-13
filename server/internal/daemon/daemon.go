@@ -90,7 +90,7 @@ const (
 	// execution-environment setup, and the StartTask request itself. It is
 	// intentionally independent from AgentTimeout, which only governs the
 	// provider process after the task reaches running.
-	defaultTaskPrepareTimeout = 5 * time.Minute
+	defaultTaskPrepareTimeout = 30 * time.Minute
 	// pendingWorkHeartbeatTimeout bounds the out-of-band heartbeat a
 	// server-pushed daemon:pending_work hint triggers (MUL-5444). Short on
 	// purpose: the hint is only a latency optimisation, and the scheduled
