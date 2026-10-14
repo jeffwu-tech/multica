@@ -228,6 +228,41 @@ func TestSharedIssueWorktreeRefusesAReplayOverOverlappingUncommittedWork(t *test
 	}
 }
 
+// Squashing the issue branch for review rewrites the commit its record points
+// at; the branch is still the issue's, since only its worktree has it out.
+func TestSharedIssueWorktreeSurvivesASquashedBranch(t *testing.T) {
+	t.Parallel()
+	repo := newTestRepo(t)
+	issueRoot := filepath.Join(t.TempDir(), "issue")
+
+	first := mustPrepareShared(t, repo, issueRoot, "agent-a", turnOneTask, workItemTitle)
+	writeFile(t, filepath.Join(first.WorkDir, "tracked.txt"), "one\n")
+	gitRun(t, first.Path, "commit", "-qam", "one")
+	writeFile(t, filepath.Join(first.WorkDir, "tracked.txt"), "two\n")
+	gitRun(t, first.Path, "commit", "-qam", "two")
+	finalizeOK(t, first)
+	gitRun(t, first.Path, "reset", "-q", "--soft", "main")
+	gitRun(t, first.Path, "commit", "-qm", "squashed after the run")
+
+	second := mustPrepareShared(t, repo, issueRoot, "agent-b", turnTwoTask, workItemTitle)
+	if !second.Reused || second.Branch != first.Branch {
+		t.Fatalf("second run: reused=%v branch=%q; want the squashed branch", second.Reused, second.Branch)
+	}
+	writeFile(t, filepath.Join(second.WorkDir, "tracked.txt"), "three\n")
+	gitRun(t, second.Path, "commit", "-qam", "three")
+	gitRun(t, second.Path, "reset", "-q", "--soft", "main")
+	gitRun(t, second.Path, "commit", "-qm", "squashed during the run")
+	finalizeOK(t, second)
+
+	third := mustPrepareShared(t, repo, issueRoot, "agent-a", turnThreeTask, workItemTitle)
+	if !third.Reused {
+		t.Fatal("third run did not reuse the worktree")
+	}
+	if got := readFile(t, filepath.Join(third.WorkDir, "tracked.txt")); got != "three\n" {
+		t.Errorf("tracked.txt = %q, want the squashed work", got)
+	}
+}
+
 func TestSharedIssueWorktreeHandsAnOpenMergeToTheNextRun(t *testing.T) {
 	t.Parallel()
 	repo := newTestRepo(t)

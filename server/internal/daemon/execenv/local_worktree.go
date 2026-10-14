@@ -1399,12 +1399,8 @@ func planForConversationBranch(gitRoot, name, headSHA string, owner branchOwner,
 // A branch with no record is not ours by definition: every branch this code
 // creates writes one before its task is allowed to run.
 func branchOwnedBy(gitRoot, branch string, owner branchOwner, logger *slog.Logger) (branchRecord, bool) {
-	ref, err := readUserStateRef(gitRoot, branch)
-	if err != nil || ref == "" {
-		return branchRecord{}, false
-	}
-	record, err := readBranchRecord(gitRoot, ref)
-	if err != nil || record.owner != owner || record.checkpoint == "" {
+	record, ok := branchRecordedFor(gitRoot, branch, owner)
+	if !ok {
 		return branchRecord{}, false
 	}
 	if _, err := runGit(gitRoot, "merge-base", "--is-ancestor", record.checkpoint, "refs/heads/"+branch); err != nil {
@@ -1412,6 +1408,20 @@ func branchOwnedBy(gitRoot, branch string, owner branchOwner, logger *slog.Logge
 			logger.Info("execenv: branch no longer contains the commit it was recorded at; not continuing it",
 				"git_root", gitRoot, "branch", branch, "checkpoint", record.checkpoint)
 		}
+		return branchRecord{}, false
+	}
+	return record, true
+}
+
+// branchRecordedFor reports whether a branch's record names owner, without
+// the continuity check branchOwnedBy adds on top.
+func branchRecordedFor(gitRoot, branch string, owner branchOwner) (branchRecord, bool) {
+	ref, err := readUserStateRef(gitRoot, branch)
+	if err != nil || ref == "" {
+		return branchRecord{}, false
+	}
+	record, err := readBranchRecord(gitRoot, ref)
+	if err != nil || record.owner != owner || record.checkpoint == "" {
 		return branchRecord{}, false
 	}
 	return record, true
@@ -1602,6 +1612,11 @@ func (w *LocalWorktree) verifyDeliveryPoint(tip string) error {
 	if branchTip != tip {
 		return fmt.Errorf("the worktree delivered %s while branch %s points at %s, so the run did not deliver onto its own branch",
 			shortID(tip), w.Branch, shortID(branchTip))
+	}
+	// A shared worktree carries its state uncommitted and keeps the branch
+	// checked out, so a squash or rebase run in it is still this issue's line.
+	if w.Shared {
+		return nil
 	}
 	if w.BaseCommit == "" {
 		return fmt.Errorf("branch %s has no commit of this task's own to prove it by", w.Branch)

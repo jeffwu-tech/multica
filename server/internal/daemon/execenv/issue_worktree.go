@@ -298,7 +298,9 @@ func reuseIssueWorktree(gitRoot, worktreePath, headSHA string, params LocalWorkt
 		return fail("the previous run's runtime files could not be removed: %v", err)
 	}
 	owner := params.owner()
-	record, owned := branchOwnedBy(gitRoot, branch, owner, logger)
+	// The branch is checked out in this issue's own worktree, so it cannot have
+	// been recreated; a squash or rebase of it is still the issue's branch.
+	record, owned := branchRecordedFor(gitRoot, branch, owner)
 	if !owned {
 		return fail("branch %s is not recorded as this issue's", branch)
 	}
