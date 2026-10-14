@@ -64,8 +64,16 @@ func TestSharedIssueWorktreeIsReusedAcrossAgents(t *testing.T) {
 		t.Errorf("agent b does not see agent a's work: %q", got)
 	}
 	writeFile(t, filepath.Join(second.WorkDir, "from-b.txt"), "agent b\n")
-	finalizeOK(t, second)
+	if outcome := finalizeOK(t, second); outcome.AutoCommitted {
+		t.Error("Finalize committed the shared worktree's uncommitted work")
+	}
+	if log := gitRun(t, repo, "log", "--format=%s", "main..JWU/WI00123456"); log != "" {
+		t.Errorf("shared runs committed their work:\n%s", log)
+	}
 
+	if err := TeardownIssueWorktree(issueRoot, worktreeTestLogger()); err != nil {
+		t.Fatalf("TeardownIssueWorktree: %v", err)
+	}
 	for file, want := range map[string]string{"from-a.txt": "agent a", "from-b.txt": "agent b"} {
 		if got := gitRun(t, repo, "show", "JWU/WI00123456:"+file); got != want {
 			t.Errorf("%s on the branch = %q, want %q", file, got, want)
@@ -128,7 +136,7 @@ func TestSharedIssueWorktreeRefusesToForkABusyBranch(t *testing.T) {
 	}
 }
 
-func TestSharedIssueWorktreeCommitsWorkAnInterruptedRunLeft(t *testing.T) {
+func TestSharedIssueWorktreeKeepsWorkAnInterruptedRunLeftUncommitted(t *testing.T) {
 	t.Parallel()
 	repo := newTestRepo(t)
 	issueRoot := filepath.Join(t.TempDir(), "issue")
@@ -141,11 +149,82 @@ func TestSharedIssueWorktreeCommitsWorkAnInterruptedRunLeft(t *testing.T) {
 	if !second.Reused {
 		t.Fatal("second run did not reuse the worktree")
 	}
-	if got := gitRun(t, repo, "show", second.Branch+":half-done.txt"); got != "interrupted" {
-		t.Errorf("interrupted run's work not committed: %q", got)
+	if got := readFile(t, filepath.Join(second.WorkDir, "half-done.txt")); got != "interrupted\n" {
+		t.Errorf("interrupted run's work lost: %q", got)
 	}
-	if dirty, err := worktreeIsDirty(second.Path); err != nil || dirty {
-		t.Errorf("worktree dirty after reuse (dirty=%v, err=%v)", dirty, err)
+	if extra := gitRun(t, repo, "rev-list", "main.."+second.Branch); extra != "" {
+		t.Errorf("interrupted run's work was committed: %s", extra)
+	}
+}
+
+// The user's edits since the last run are replayed on top of the earlier run's
+// uncommitted work, and both stay uncommitted.
+func TestSharedIssueWorktreeReplaysOverUncommittedWork(t *testing.T) {
+	t.Parallel()
+	repo := newTestRepo(t)
+	issueRoot := filepath.Join(t.TempDir(), "issue")
+
+	first := mustPrepareShared(t, repo, issueRoot, "agent-a", turnOneTask, workItemTitle)
+	writeFile(t, filepath.Join(first.WorkDir, "tracked.txt"), "agent\n")
+	writeFile(t, filepath.Join(first.WorkDir, "agent-new.txt"), "new\n")
+	finalizeOK(t, first)
+
+	writeFile(t, filepath.Join(repo, "keep.txt"), "user edit\n")
+	second := mustPrepareShared(t, repo, issueRoot, "agent-b", turnTwoTask, workItemTitle)
+	if !second.Reused || len(second.ReplayConflicts) != 0 {
+		t.Fatalf("second run: reused=%v conflicts=%v", second.Reused, second.ReplayConflicts)
+	}
+	for file, want := range map[string]string{"tracked.txt": "agent\n", "agent-new.txt": "new\n", "keep.txt": "user edit\n"} {
+		if got := readFile(t, filepath.Join(second.WorkDir, file)); got != want {
+			t.Errorf("worktree %s = %q, want %q", file, got, want)
+		}
+	}
+	if extra := gitRun(t, repo, "rev-list", "main.."+second.Branch); extra != "" {
+		t.Errorf("reused worktree was committed: %s", extra)
+	}
+	if outcome := finalizeOK(t, second); outcome.AutoCommitted {
+		t.Error("Finalize committed the shared worktree's uncommitted work")
+	}
+}
+
+func TestSharedIssueWorktreeLeavesTheFirstReplayUncommitted(t *testing.T) {
+	t.Parallel()
+	repo := newTestRepo(t)
+	writeFile(t, filepath.Join(repo, "keep.txt"), "user edit\n")
+
+	wt := mustPrepareShared(t, repo, filepath.Join(t.TempDir(), "issue"), "agent-a", turnOneTask, workItemTitle)
+	if got := readFile(t, filepath.Join(wt.WorkDir, "keep.txt")); got != "user edit\n" {
+		t.Errorf("worktree keep.txt = %q, want the user's edit", got)
+	}
+	if extra := gitRun(t, repo, "rev-list", "main.."+wt.Branch); extra != "" {
+		t.Errorf("the user's edit was committed as a baseline: %s", extra)
+	}
+	if outcome := finalizeOK(t, wt); outcome.AutoCommitted {
+		t.Error("Finalize committed the shared worktree")
+	}
+}
+
+// A user edit to a file the earlier run left uncommitted cannot be replayed
+// over it; the run fails and the worktree is left exactly as it was.
+func TestSharedIssueWorktreeRefusesAReplayOverOverlappingUncommittedWork(t *testing.T) {
+	t.Parallel()
+	repo := newTestRepo(t)
+	issueRoot := filepath.Join(t.TempDir(), "issue")
+
+	first := mustPrepareShared(t, repo, issueRoot, "agent-a", turnOneTask, workItemTitle)
+	writeFile(t, filepath.Join(first.WorkDir, "tracked.txt"), "agent\n")
+	writeFile(t, filepath.Join(first.WorkDir, "agent-new.txt"), "new\n")
+	finalizeOK(t, first)
+
+	writeFile(t, filepath.Join(repo, "tracked.txt"), "user\n")
+	if _, err := prepareSharedRun(t, repo, issueRoot, "agent-b", turnTwoTask, workItemTitle); err == nil ||
+		!strings.Contains(err.Error(), "uncommitted work in the issue worktree") {
+		t.Fatalf("err = %v, want a refusal naming the uncommitted work", err)
+	}
+	for file, want := range map[string]string{"tracked.txt": "agent\n", "agent-new.txt": "new\n"} {
+		if got := readFile(t, filepath.Join(first.WorkDir, file)); got != want {
+			t.Errorf("worktree %s = %q, want %q", file, got, want)
+		}
 	}
 }
 
@@ -157,6 +236,7 @@ func TestSharedIssueWorktreeHandsAnOpenMergeToTheNextRun(t *testing.T) {
 
 	first := mustPrepareShared(t, repo, issueRoot, "agent-a", turnOneTask, workItemTitle)
 	writeFile(t, filepath.Join(first.WorkDir, "tracked.txt"), "B\n")
+	gitRun(t, first.Path, "commit", "-qam", "agent work")
 	finalizeOK(t, first)
 
 	writeFile(t, filepath.Join(repo, "tracked.txt"), "C\n")

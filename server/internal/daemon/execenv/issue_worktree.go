@@ -20,11 +20,11 @@ import (
 // disk, and the next run continues exactly where the last one stopped.
 //
 // Everything that makes the disposable mode safe still applies per run: the
-// user's directory is snapshotted and replayed, leftovers are committed before
-// a run is reported, and the branch's owner record decides whether a branch
-// may be continued at all. What changes is only that Finalize keeps the
-// worktree, and that the next Prepare has to clean up after a run that never
-// got to finish.
+// user's directory is snapshotted and replayed, and the branch's owner record
+// decides whether a branch may be continued at all. What changes is that
+// Finalize keeps the worktree and leaves a run's uncommitted work as it is, and
+// that the next Prepare replays the user's edits on top of it and cleans up
+// after a run that never got to finish.
 
 const (
 	// issueWorktreesDirName sits directly under the workspaces root. Dot-prefixed
@@ -312,16 +312,13 @@ func reuseIssueWorktree(gitRoot, worktreePath, headSHA string, params LocalWorkt
 		if dirtyErr != nil {
 			return fail("could not read its status: %v", dirtyErr)
 		}
-		if dirty {
-			// Only a run that died before Finalize leaves changes behind; keep them.
-			if _, commitErr := commitEverything(worktreePath, "chore(agent): uncommitted work left by an interrupted run", false); commitErr != nil {
-				return fail("could not commit the work an interrupted run left: %v", commitErr)
-			}
-			if logger != nil {
-				logger.Warn("execenv: committed work an interrupted run left in the issue worktree",
-					"path", worktreePath, "branch", branch)
-			}
-		} else if _, mergedErr := runGit(gitRoot, "merge-base", "--is-ancestor", branch, headSHA); mergedErr == nil {
+		// Uncommitted work stays where it is, and the replay lands on top of it.
+		merged := false
+		if !dirty {
+			_, mergedErr := runGit(gitRoot, "merge-base", "--is-ancestor", branch, headSHA)
+			merged = mergedErr == nil
+		}
+		if merged {
 			// Everything on the branch is already in the user's HEAD (merged, or no
 			// commits yet): restart it there, in place, rather than re-checking out.
 			if out, resetErr := runGit(worktreePath, "reset", "--hard", headSHA); resetErr != nil {

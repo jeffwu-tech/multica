@@ -8277,7 +8277,8 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// the user's repo. Deferred against the named return so a task that fails
 	// mid-run still hands back the branch holding its partial work instead of
 	// letting `git worktree remove --force` delete it. A failing task is
-	// exactly when the user most wants to see how far the agent got.
+	// exactly when the user most wants to see how far the agent got. A shared
+	// issue worktree is kept instead, with its uncommitted work left in place.
 	//
 	// In-place local_directory runs never enter this block: their WorkDir is
 	// already durable, so DurableWorkDir deliberately stays absent instead of
@@ -8297,7 +8298,8 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			if finalizeErr == nil {
 				// The configured local_directory becomes authoritative only after
 				// Finalize confirms the disposable task worktree is actually gone.
-				if localAssignment != nil {
+				// A shared worktree stays and may hold uncommitted work, so WorkDir stays authoritative.
+				if localAssignment != nil && !env.LocalWorktree.Shared {
 					taskResult.DurableWorkDir = localAssignment.AbsPath
 				}
 				return

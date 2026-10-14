@@ -33,9 +33,9 @@ import (
 //     is disposable. What lasts in the user's repo is the branch, plus one
 //     hidden ref per branch recording who owns it and what it carries.
 //  3. Nothing is silently discarded. Whatever the agent leaves uncommitted is
-//     committed to the branch before the worktree goes away, and an edit of the
-//     user's that could not be merged is offered again next turn rather than
-//     recorded as delivered.
+//     committed to the branch before the worktree goes away — for a shared issue
+//     worktree, only when it is torn down — and an edit of the user's that could
+//     not be merged is offered again next turn rather than recorded as delivered.
 
 const (
 	// localWorktreeDirName is the env-root-relative directory holding the
@@ -292,7 +292,8 @@ type LocalWorktreeOutcome struct {
 	// so it never shows up in the user's `git branch` as an empty artifact.
 	Branch string
 	// AutoCommitted is true when the agent left uncommitted changes that
-	// Finalize committed so they would survive the worktree's removal.
+	// Finalize committed so they would survive the worktree's removal. Always
+	// false for a shared worktree, unless the run concluded a replayed merge.
 	AutoCommitted bool
 	// PreservedPath is set only when Finalize could NOT commit the agent's
 	// changes. The worktree at this path was intentionally left on disk because
@@ -494,7 +495,7 @@ func PrepareLocalWorktree(params LocalWorktreeParams, logger *slog.Logger) (*Loc
 		}
 	} else {
 		var replayErr error
-		replay, replayErr = replayUserState(worktreePath, plan, userState, logger)
+		replay, replayErr = replayUserState(worktreePath, plan, userState, shared, logger)
 		if replayErr != nil {
 			rollback()
 			return nil, replayErr
@@ -525,34 +526,36 @@ func PrepareLocalWorktree(params LocalWorktreeParams, logger *slog.Logger) (*Loc
 	//
 	// Skipped entirely while the replay is unresolved: an index with unmerged
 	// entries cannot be committed without committing conflict markers, and the
-	// agent has not had its turn at them yet.
+	// agent has not had its turn at them yet. Also skipped for a shared worktree:
+	// it persists between runs, so the replay stays uncommitted alongside any
+	// earlier run's work instead of being committed as the user's.
 	if len(replay.conflicts) == 0 {
-		dirty, dirtyErr := worktreeIsDirty(worktreePath)
-		if dirtyErr != nil {
-			rollback()
-			return nil, fmt.Errorf("execenv: could not inspect the prepared worktree for %q: %w", gitRoot, dirtyErr)
-		}
-		// A branch this prepare created gets its baseline even when there was
-		// nothing to replay. Two things need it. The empty case is the one that
-		// used to be skipped, and it is the one where the branch sits exactly on
-		// the user's own HEAD — so the branch had no commit of its own, and
-		// nothing distinguished it from a branch the user creates there
-		// themselves. And `git diff <baseline>..<branch>` is then the agent's
-		// work on every branch, not only on the ones that started dirty.
-		// A shared issue branch gets no empty baseline: it stays checked out in its
-		// worktree, so the user cannot recreate it under the same name meanwhile.
-		if dirty || (!plan.continues && !shared) {
-			baseline, baseErr := commitBaseline(worktreePath, plan.continues, dirty)
-			if baseErr != nil {
-				// Without a baseline the task cannot tell the user's work from the
-				// agent's, so it would later commit the user's files as if the agent
-				// had produced them. Refuse rather than deliver a misleading branch.
+		if !shared {
+			dirty, dirtyErr := worktreeIsDirty(worktreePath)
+			if dirtyErr != nil {
 				rollback()
-				return nil, fmt.Errorf("execenv: could not record a baseline commit for the replayed state of %q: %w", gitRoot, baseErr)
+				return nil, fmt.Errorf("execenv: could not inspect the prepared worktree for %q: %w", gitRoot, dirtyErr)
 			}
-			// The branch now stands on a commit that carries this turn's snapshot,
-			// and everything downstream measures the delivery against it.
-			wt.BaseCommit = baseline
+			// A branch this prepare created gets its baseline even when there was
+			// nothing to replay. Two things need it. The empty case is the one that
+			// used to be skipped, and it is the one where the branch sits exactly on
+			// the user's own HEAD — so the branch had no commit of its own, and
+			// nothing distinguished it from a branch the user creates there
+			// themselves. And `git diff <baseline>..<branch>` is then the agent's
+			// work on every branch, not only on the ones that started dirty.
+			if dirty || !plan.continues {
+				baseline, baseErr := commitBaseline(worktreePath, plan.continues, dirty)
+				if baseErr != nil {
+					// Without a baseline the task cannot tell the user's work from the
+					// agent's, so it would later commit the user's files as if the agent
+					// had produced them. Refuse rather than deliver a misleading branch.
+					rollback()
+					return nil, fmt.Errorf("execenv: could not record a baseline commit for the replayed state of %q: %w", gitRoot, baseErr)
+				}
+				// The branch now stands on a commit that carries this turn's snapshot,
+				// and everything downstream measures the delivery against it.
+				wt.BaseCommit = baseline
+			}
 		}
 		// The branch now carries this snapshot, so record it — together with the
 		// owner, which is what lets the next task prove this branch is its own
@@ -603,7 +606,8 @@ func PrepareLocalWorktree(params LocalWorktreeParams, logger *slog.Logger) (*Loc
 
 // Finalize commits whatever the agent left behind, removes the worktree, and
 // reports the branch. Called after the agent exits, before the env root is
-// handed to the GC.
+// handed to the GC. A shared issue worktree is kept instead, uncommitted work
+// and all; TeardownIssueWorktree commits it once the issue is done.
 //
 // The auto-commit is the reason a worktree task can't lose work: `git worktree
 // remove --force` would happily delete uncommitted edits, and the user would
@@ -690,7 +694,9 @@ func (w *LocalWorktree) Finalize(logger *slog.Logger) (LocalWorktreeOutcome, err
 		}
 		dirty = true
 	}
-	if dirty {
+	// A shared worktree outlives the run, so its leftovers stay uncommitted for
+	// the next run; only a run concluding a replayed merge has to commit it.
+	if dirty && (!w.Shared || w.snapshotPending) {
 		committed, err := w.commitAll(logger)
 		if err != nil {
 			outcome.PreservedPath = w.Path
@@ -914,8 +920,10 @@ func commitBaseline(worktreePath string, continued, dirty bool) (string, error) 
 func (w *LocalWorktree) commitAll(logger *slog.Logger) (bool, error) {
 	// Never --allow-empty here: an empty commit would make a read-only turn look
 	// like it produced work and leave its branch behind.
-	return commitEverything(w.Path, "chore(agent): uncommitted changes from task", false)
+	return commitEverything(w.Path, agentLeftoversCommitMessage, false)
 }
+
+const agentLeftoversCommitMessage = "chore(agent): uncommitted changes from task"
 
 // commitEverything returns (false, nil) for the benign "there was nothing to
 // commit" case and (false, err) for a real failure — the distinction callers
@@ -1486,7 +1494,7 @@ type replayResult struct {
 // the user's newer edit survives. Dropping it would lose that edit twice over:
 // once from this turn's tree, and again from every later turn, because the
 // snapshot would advance past a change the branch never took.
-func replayUserState(worktreePath string, plan taskBranchPlan, snapshot string, logger *slog.Logger) (replayResult, error) {
+func replayUserState(worktreePath string, plan taskBranchPlan, snapshot string, keepLocalChanges bool, logger *slog.Logger) (replayResult, error) {
 	carried := plan.base
 	if plan.continues {
 		carried = plan.priorState
@@ -1515,6 +1523,12 @@ func replayUserState(worktreePath string, plan taskBranchPlan, snapshot string, 
 		return replayResult{}, nil
 	}
 	conflicts, listErr := unmergedPaths(worktreePath)
+	if (listErr != nil || len(conflicts) == 0) && keepLocalChanges {
+		// The worktree may hold an earlier run's uncommitted work, which a reset would destroy.
+		_, _ = runGit(worktreePath, "cherry-pick", "--quit")
+		return replayResult{}, fmt.Errorf("execenv: could not replay your local edits over the uncommitted work in the issue worktree at %s; "+
+			"commit or discard the overlapping changes there and retry: %s: %w", worktreePath, strings.TrimSpace(out), pickErr)
+	}
 	if listErr != nil || len(conflicts) == 0 {
 		// Not a conflict, so the replay failed for a reason the agent cannot
 		// resolve. Fail closed rather than start on a half-applied tree.
