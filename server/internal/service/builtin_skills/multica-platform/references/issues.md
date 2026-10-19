@@ -128,8 +128,8 @@ concurrent edits. There is no CLI bulk-export or `--all` mode.
 Workspaces may define custom issue properties (Severity, Environment, QA
 Status, Reviewer, ...). They are the place for durable, typed issue state:
 values are validated against the definition (select options, date format,
-http(s) URL, member reference), visible in the issue sidebar, and addressed
-by name.
+http(s) URL, member reference, free-form text/URL lists), visible in the
+issue sidebar, and addressed by name.
 
 - Read what exists before writing: `multica property list` shows the catalog;
   `multica issue property list <issue-id>` shows values set on the issue.
@@ -147,6 +147,14 @@ multica issue property unset <issue-id> --name Environment
   workspace members only. `--value` takes a member name, email, UUID, short id,
   or an explicit `member:<uuid>`; `multi_actor` takes a comma-separated list
   (duplicates dropped, order kept, max 20).
+- `multi_text` / `multi_url` properties hold free-form lists: `--value` is a
+  comma-separated list of strings / http(s) URLs (empty entries skipped,
+  duplicates dropped, order kept, max 20). They take no options. An entry that
+  itself contains a comma cannot survive that form — pass a JSON array instead:
+  `--value '["Smith, John","https://en.wikipedia.org/wiki/Washington,_D.C."]'`.
+  The array form is always safe; use it whenever any entry has a comma or the
+  input starts with `[`, for example `--value '["[draft] spec"]'`. The same
+  forms work during creation: `--property 'Aliases=["Smith, John","[draft] spec"]'`.
 - Definitions may include an optional catalog icon for visual identification;
   it does not change the property's type or value validation.
 - Agents cannot create or edit property definitions (owner/admin humans only).
@@ -166,7 +174,8 @@ multica issue list --sort property:Impact --direction desc --output json
   matches ANY of its values; different properties must ALL match. Values are
   option names or ids (select types), `true`/`false` (checkbox), a member
   name/email/id (actor types), or the value itself for text, url, number,
-  and date (`YYYY-MM-DD`). The reserved value `__none__` matches
+  and date (`YYYY-MM-DD`); for `multi_text` / `multi_url` the value matches
+  any single element of the list exactly. The reserved value `__none__` matches
   issues where the property is unset (works for every type; it is not
   index-backed, so use it for targeted audits rather than as a default
   listing filter). Only `=` is supported today; the `>=`, `<=` and `!=`
@@ -175,7 +184,7 @@ multica issue list --sort property:Impact --direction desc --output json
   an ordinal scale (Low < Medium < High) sorts by meaning — and number/date/
   text/url by value; issues without the property sort last either way.
   Archived properties and types without an order (multi_select, checkbox,
-  actor kinds) are rejected up front.
+  actor kinds, list types) are rejected up front.
 - `issue list` and `issue get` return `properties` as a map of definition id
   to stored value. Add `--resolve-properties` in JSON mode to get the rows
   `issue property list` prints instead (name, type, stored value, display
@@ -187,8 +196,9 @@ multica issue list --status in_progress --output json --resolve-properties
 multica issue get <issue-id> --resolve-properties
 ```
 
-  Read `display` for a single value and `display_values` for a multi_select
-  or multi_actor value; `value` keeps the stored ids.
+  Read `display` for a single value and `display_values` for a multi-value
+  property (multi_select, multi_actor, multi_text, multi_url); `value` keeps
+  the stored ids / strings.
 
 ## Status changes have server side effects
 
@@ -256,6 +266,9 @@ archived statuses remain readable via an explicit status filter.
 - **Failed issue-triggered tasks** may roll an issue from `in_progress` back to
   `todo` when no active task / retry remains — that is the main server-owned
   status write on the agent-run path.
+- **Project workflows** can limit which statuses an issue takes and turn a
+  status change into a handoff to another agent. When the per-turn prompt
+  carries a `[Project workflow]` block, read `references/projects.md`.
 
 ## Who else is running right now
 
@@ -433,7 +446,7 @@ multica issue wakeup create <issue> --until-issue <other-issue-id> --until-issue
 ```
 
 - `--until-status KEY` — this issue's status is that key (built-in or one of the workspace's statuses).
-- `--until-pr checks` — a linked pull request's checks finished, passing or failing, on its current head. `--until-pr merged` — a linked pull request merged. With several linked pull requests, any one satisfies it.
+- `--until-pr checks` — a linked pull request's checks finished, passing or failing, on its current head. `--until-pr merged` — a linked pull request merged. With several linked pull requests, any one satisfies it. Both conditions inspect only PRs linked directly to this issue; they do not inherit a parent issue's PRs. Check evaluation also requires server-side GitHub snapshots. A missing link or snapshot is recorded in the rule's `last_error` and retried automatically rather than rejecting the rule.
 - `--until-children-done` — every sub-issue, staged or not, is closed (`done` or `cancelled`). With `--stage N` it waits only for staged sub-issues up to stage N, and stage N must have at least one. A parent with no sub-issues never fires. The parent's assignee already gets the sub-issue wakeup described under Stages; do not add this condition for the same wake.
 - `--until-issue ISSUE` — another issue in this workspace (identifier or UUID) reaches `--until-issue-state`: `done` (default), `ended` (done or cancelled), or `in_review`.
 - The same form also accepts `--until-assignee member|agent|squad:ID`, `--until-label LABEL_ID`, and `--until-property PROPERTY_ID=VALUE` (VALUE may be JSON). `multica issue wakeup create --help` lists them.
