@@ -33,6 +33,10 @@ func TestMain(m *testing.M) {
 		runFakeCursorStream(mode)
 		os.Exit(0)
 	}
+	if os.Getenv(copilotFakeStreamEnv) != "" {
+		runFakeCopilotStream()
+		os.Exit(0)
+	}
 	switch mode := os.Getenv("CLAUDE_FAKE_MODE"); mode {
 	case "":
 		// Preserve the production relationships while avoiding hundreds of

@@ -881,14 +881,14 @@ func (s *claudeUsageSnapshot) appendedCostStateUsage() (map[string]TokenUsage, b
 }
 
 func claudeConfigDir(env []string, cwd string) (string, error) {
-	if value, ok := lastClaudeEnvValue(env, "CLAUDE_CONFIG_DIR"); ok && value != "" {
+	if value, ok := lastEnvValue(env, "CLAUDE_CONFIG_DIR"); ok && value != "" {
 		return resolveClaudeConfigPath(value, cwd)
 	}
 	if runtime.GOOS == "windows" {
-		if value, ok := lastClaudeEnvValue(env, "USERPROFILE"); ok && value != "" {
+		if value, ok := lastEnvValue(env, "USERPROFILE"); ok && value != "" {
 			return resolveClaudeConfigPath(filepath.Join(value, ".claude"), cwd)
 		}
-	} else if value, ok := lastClaudeEnvValue(env, "HOME"); ok && value != "" {
+	} else if value, ok := lastEnvValue(env, "HOME"); ok && value != "" {
 		return resolveClaudeConfigPath(filepath.Join(value, ".claude"), cwd)
 	}
 	home, err := os.UserHomeDir()
@@ -919,7 +919,9 @@ func resolveClaudeConfigPath(path, cwd string) (string, error) {
 	return absolutePath, nil
 }
 
-func lastClaudeEnvValue(env []string, key string) (string, bool) {
+// lastEnvValue returns the effective value of key in env, matching keys
+// case-insensitively on Windows the way the OS does.
+func lastEnvValue(env []string, key string) (string, bool) {
 	for i := len(env) - 1; i >= 0; i-- {
 		name, value, ok := strings.Cut(env[i], "=")
 		matches := name == key

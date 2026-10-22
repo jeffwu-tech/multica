@@ -41,40 +41,48 @@ type copilotEventState struct {
 	finalStatus  string
 	finalError   string
 
-	// Token usage arrives on up to three different events, so each source is
-	// accumulated separately and resolved once at the end by resolveUsage.
+	// Token usage arrives on several different events, so each source is
+	// collected separately and resolved once at the end by resolveUsage.
 	//
-	//	session.shutdown   per-model session totals, full breakdown
-	//	assistant.usage    per model call, full breakdown
-	//	assistant.message  outputTokens only — legacy, older CLIs
+	//	session.usage_checkpoint  cumulative per-model session totals (current CLIs)
+	//	session.shutdown          the same cumulative totals (older CLIs only)
+	//	assistant.usage           per model call, full breakdown (older CLIs only)
+	//	assistant.message         outputTokens only (older CLIs only)
 	//
-	// They must never be summed together: all three describe the same tokens.
-	callUsage     map[string]TokenUsage
-	msgUsage      map[string]TokenUsage
-	shutdownUsage map[string]TokenUsage
-	// resumed marks a run that continued an existing Copilot session, which is
-	// what disqualifies the session.shutdown totals — see resolveUsage.
+	// They must never be summed together: all of them describe the same tokens.
+	callUsage map[string]TokenUsage
+	msgUsage  map[string]TokenUsage
+	// sessionTotals is the latest cumulative snapshot, in the CLI's raw shape
+	// (inputTokens still includes the cache tiers). Each snapshot replaces the
+	// previous one.
+	sessionTotals map[string]copilotUsageData
+	// resumed marks a run that continued an existing Copilot session. The CLI
+	// restores its accumulators on resume, so sessionTotals then also carries
+	// every earlier run's tokens.
 	resumed bool
+	// baseline is the cumulative snapshot the resumed session had reached
+	// before this run started, read from the CLI's session log. nil means it
+	// is unknown, which disqualifies sessionTotals on a resumed run.
+	baseline map[string]copilotUsageData
 }
 
 // resolveUsage picks the single best usage source this run produced, most
 // complete first.
 //
-// On a fresh session, session.shutdown is the CLI's own final accounting for
-// the whole session — which here IS this run — so it is the most complete
-// source available and cannot be short-changed by an individual model call
-// that failed to report. It is unusable on a resumed run: the CLI restores its
-// accumulators from a checkpoint, so it also carries every earlier turn's
-// tokens, and reporting that on a follow-up would bill the same tokens once per
-// turn. Under-reporting beats double-billing, so a resumed run falls through.
+// The session totals are the CLI's own accounting, so they cannot be
+// short-changed by an individual model call that failed to report. On a fresh
+// session they ARE this run; on a resumed one they are scoped to this run by
+// subtracting the baseline. Without a baseline a resumed run falls through:
+// reporting the raw totals would bill every earlier turn again, and
+// under-reporting beats double-billing.
 //
 // assistant.usage is per model call, so it measures exactly this run either
 // way. assistant.message is last: it only ever carries output tokens, so
 // letting it win over a source with the full breakdown would silently drop the
 // input and cache tiers.
 func (st *copilotEventState) resolveUsage() map[string]TokenUsage {
-	if !st.resumed && hasTokens(st.shutdownUsage) {
-		return st.shutdownUsage
+	if run := st.runTotals(); hasTokens(run) {
+		return run
 	}
 	if hasTokens(st.callUsage) {
 		return st.callUsage
@@ -83,6 +91,40 @@ func (st *copilotEventState) resolveUsage() map[string]TokenUsage {
 		return st.msgUsage
 	}
 	return map[string]TokenUsage{}
+}
+
+// runTotals scopes the cumulative session snapshot to this run.
+func (st *copilotEventState) runTotals() map[string]TokenUsage {
+	out := make(map[string]TokenUsage)
+	if st.resumed && st.baseline == nil {
+		return out
+	}
+	for model, cur := range st.sessionTotals {
+		prev := st.baseline[model]
+		addUsage(out, model,
+			nonNegativeTokens(cur.InputTokens-prev.InputTokens),
+			nonNegativeTokens(cur.OutputTokens-prev.OutputTokens),
+			nonNegativeTokens(cur.CacheReadTokens-prev.CacheReadTokens),
+			nonNegativeTokens(cur.CacheWriteTokens-prev.CacheWriteTokens))
+	}
+	return out
+}
+
+// setSessionTotals records a cumulative snapshot. An empty snapshot is
+// ignored: totals never shrink, so it can only mean a payload shape that
+// omitted them, and it must not wipe a real earlier snapshot.
+func (st *copilotEventState) setSessionTotals(metrics map[string]copilotShutdownModelMetric) {
+	if len(metrics) == 0 {
+		return
+	}
+	totals := make(map[string]copilotUsageData, len(metrics))
+	for model, m := range metrics {
+		if model == "" {
+			model = st.activeModel
+		}
+		totals[model] = m.Usage
+	}
+	st.sessionTotals = totals
 }
 
 // hasTokens reports whether a source carries any real numbers. Presence alone
@@ -140,12 +182,11 @@ func (st *copilotEventState) finalOutput() string {
 
 func newCopilotEventState(seedModel string, resumed bool) *copilotEventState {
 	return &copilotEventState{
-		activeModel:   seedModel,
-		finalStatus:   "completed",
-		callUsage:     make(map[string]TokenUsage),
-		msgUsage:      make(map[string]TokenUsage),
-		shutdownUsage: make(map[string]TokenUsage),
-		resumed:       resumed,
+		activeModel: seedModel,
+		finalStatus: "completed",
+		callUsage:   make(map[string]TokenUsage),
+		msgUsage:    make(map[string]TokenUsage),
+		resumed:     resumed,
 	}
 }
 
@@ -242,17 +283,12 @@ func handleCopilotEvent(evt copilotEvent, st *copilotEventState) []Message {
 		}
 		addUsage(st.callUsage, model, u.InputTokens, u.OutputTokens, u.CacheReadTokens, u.CacheWriteTokens)
 
-	case "session.shutdown":
-		// Session-wide per-model totals, emitted once as the session tears down.
-		var sd copilotShutdownData
-		if err := json.Unmarshal(evt.Data, &sd); err != nil {
-			return nil
-		}
-		for model, m := range sd.ModelMetrics {
-			if model == "" {
-				model = st.activeModel
-			}
-			addUsage(st.shutdownUsage, model, m.Usage.InputTokens, m.Usage.OutputTokens, m.Usage.CacheReadTokens, m.Usage.CacheWriteTokens)
+	case "session.usage_checkpoint", "session.shutdown":
+		// Cumulative per-model session totals. Current CLIs emit
+		// session.usage_checkpoint after every turn and keep session.shutdown
+		// off stdout; older CLIs emitted only session.shutdown.
+		if metrics, ok := copilotSnapshotMetrics(evt); ok {
+			st.setSessionTotals(metrics)
 		}
 
 	case "assistant.reasoning", "assistant.reasoning_delta":
@@ -357,6 +393,13 @@ func (b *copilotBackend) Execute(ctx context.Context, prompt string, opts ExecOp
 	}
 	cmd.Env = buildEnv(b.cfg.Env)
 
+	// Read before the process starts: the CLI appends this run's own
+	// checkpoints to the same log.
+	var baseline map[string]copilotUsageData
+	if opts.ResumeSessionID != "" {
+		baseline = b.loadUsageBaseline(cmd.Env, opts)
+	}
+
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		cancel()
@@ -386,6 +429,7 @@ func (b *copilotBackend) Execute(ctx context.Context, prompt string, opts ExecOp
 			seedModel = "copilot"
 		}
 		st := newCopilotEventState(seedModel, opts.ResumeSessionID != "")
+		st.baseline = baseline
 
 		go func() {
 			<-runCtx.Done()
@@ -437,14 +481,14 @@ func (b *copilotBackend) Execute(ctx context.Context, prompt string, opts ExecOp
 		usage := st.resolveUsage()
 		// A run that produced output but no tokens is a silent billing hole:
 		// the daemon skips reporting empty usage, so nothing surfaces anywhere
-		// downstream. This is the current state on Copilot CLI 1.0.77 (see
-		// copilotUsageData), and it went unnoticed until a user reported it —
-		// log it so the next regression is visible from the daemon log alone.
+		// downstream. Log it so a regression is visible from the daemon log.
 		if len(usage) == 0 && st.finalStatus == "completed" {
 			b.cfg.Logger.Warn("copilot reported no token usage",
 				"session", st.sessionID,
 				"model", st.activeModel,
-				"hint", "Copilot CLI filters assistant.usage and session.shutdown out of --output-format json; only assistant.message.outputTokens remains, and newer CLIs no longer populate it")
+				"resumed", st.resumed,
+				"baseline_known", st.baseline != nil,
+				"hint", "Copilot CLI emitted no session.usage_checkpoint with modelMetrics, or this resumed run had no usage baseline in the Copilot session log")
 		}
 
 		resCh <- Result{
@@ -495,9 +539,8 @@ type copilotSessionStart struct {
 
 // copilotAssistantMessage is data payload for "assistant.message".
 //
-// OutputTokens is optional in the CLI's own event schema and is the ONLY token
-// field that survives onto the `--output-format json` stream — see the
-// suppression note on copilotUsageData.
+// OutputTokens is optional in the CLI's own event schema and current CLIs no
+// longer populate it; token accounting comes from session.usage_checkpoint.
 type copilotAssistantMessage struct {
 	MessageID     string               `json:"messageId"`
 	Model         string               `json:"model"`
@@ -508,20 +551,19 @@ type copilotAssistantMessage struct {
 	ReasoningText string               `json:"reasoningText,omitempty"`
 }
 
-// copilotUsageData is data payload for "assistant.usage": one record per model
-// API call, carrying the only complete token breakdown the CLI produces.
+// copilotUsageData is a token breakdown: the "assistant.usage" payload (one
+// record per model API call) and the per-model usage inside the cumulative
+// session snapshots.
 //
 // InputTokens INCLUDES the cached tiers; addUsage subtracts them back out. The
 // payload also carries reasoningTokens, deliberately not parsed here: those are
 // a subset of outputTokens, so counting them would double-bill reasoning.
 //
-// NOTE (Copilot CLI 1.0.77): the CLI's JSONL writer drops a fixed set of event
-// types before writing stdout, and both "assistant.usage" and
-// "session.shutdown" are on that list — so on a current CLI neither reaches us
-// and Copilot runs report no tokens at all. Everything here is still parsed
-// because older CLIs, and any future build that stops filtering them, deliver
-// real numbers through exactly these events. The `result` event we already
-// parse carries premiumRequests and durations but no token counts.
+// NOTE (Copilot CLI 1.0.77+): the CLI's JSONL writer drops a fixed set of
+// event types before writing stdout, including "assistant.usage" and
+// "session.shutdown". "session.usage_checkpoint" is not on that list, and it is
+// what current CLIs are accounted from. The other sources are still parsed for
+// older CLIs.
 type copilotUsageData struct {
 	Model            string `json:"model"`
 	InputTokens      int64  `json:"inputTokens"`
@@ -536,8 +578,35 @@ type copilotShutdownData struct {
 	ModelMetrics map[string]copilotShutdownModelMetric `json:"modelMetrics"`
 }
 
+// copilotUsageCheckpointData is data payload for "session.usage_checkpoint",
+// emitted after each turn. Its accountingSnapshot holds the same cumulative
+// per-model totals session.shutdown reports.
+type copilotUsageCheckpointData struct {
+	AccountingSnapshot *copilotShutdownData `json:"accountingSnapshot"`
+}
+
 type copilotShutdownModelMetric struct {
 	Usage copilotUsageData `json:"usage"`
+}
+
+// copilotSnapshotMetrics extracts the cumulative per-model totals from a
+// session.usage_checkpoint or session.shutdown event.
+func copilotSnapshotMetrics(evt copilotEvent) (map[string]copilotShutdownModelMetric, bool) {
+	switch evt.Type {
+	case "session.usage_checkpoint":
+		var cp copilotUsageCheckpointData
+		if err := json.Unmarshal(evt.Data, &cp); err != nil || cp.AccountingSnapshot == nil {
+			return nil, false
+		}
+		return cp.AccountingSnapshot.ModelMetrics, true
+	case "session.shutdown":
+		var sd copilotShutdownData
+		if err := json.Unmarshal(evt.Data, &sd); err != nil {
+			return nil, false
+		}
+		return sd.ModelMetrics, true
+	}
+	return nil, false
 }
 
 // copilotToolRequest is one tool invocation inside assistant.message.

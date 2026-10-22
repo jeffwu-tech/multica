@@ -708,11 +708,10 @@ func TestCopilotAssistantMessageModelAttribution(t *testing.T) {
 
 func TestCopilotModernStreamReportsNoUsage(t *testing.T) {
 	t.Parallel()
-	// Copilot CLI 1.0.77 shape: assistant.message without outputTokens or model,
-	// tool.execution_complete without model, and no assistant.usage /
-	// session.shutdown (the CLI filters both off stdout). Nothing to report —
-	// this documents the upstream gap so a future CLI change shows up as a
-	// failing test rather than a silent one.
+	// Copilot CLI 1.0.77 shape without a session.usage_checkpoint: assistant.message
+	// without outputTokens or model, tool.execution_complete without model, and
+	// no assistant.usage / session.shutdown (the CLI filters both off stdout).
+	// With no checkpoint there is nothing to report.
 	lines := []string{
 		`{"type":"session.start","data":{"sessionId":"s1","version":1,"producer":"copilot-agent"},"id":"e1","timestamp":"2026-08-04T08:00:00.000Z"}`,
 		`{"type":"assistant.turn_start","data":{"turnId":"t1"},"id":"e2","timestamp":"2026-08-04T08:00:01.000Z"}`,
