@@ -23,6 +23,7 @@ import {
   ChevronLeft,
   ChevronRight,
   CircleCheck,
+  FoldHorizontal,
   Milestone,
   MoreHorizontal,
   PanelRight,
@@ -31,6 +32,7 @@ import {
   Plus,
   SlidersHorizontal,
   Tag,
+  UnfoldHorizontal,
   Unlink,
   Users,
 } from "lucide-react";
@@ -148,6 +150,7 @@ import {
   useResolvedExpandStore,
   useSubIssuesCollapseStore,
   useSubIssueDisplayStore,
+  useIssueDetailLayoutStore,
   SUB_ISSUE_ROW_PROPERTY_KEYS,
   type SubIssueRowProperties,
   type SubIssueRowPropertyKey,
@@ -1221,6 +1224,7 @@ export function IssueDetailSkeleton({
   trailing,
   sidebar = true,
 }: { leading?: ReactNode; trailing?: ReactNode; sidebar?: boolean } = {}) {
+  const wideContent = useIssueDetailLayoutStore((s) => s.wideContent);
   return (
     <div className="flex flex-1 min-h-0 flex-col">
       {/* The way back is real from the first frame, not once the issue lands:
@@ -1242,7 +1246,12 @@ export function IssueDetailSkeleton({
         <div className="flex-1 overflow-y-auto [scrollbar-gutter:stable_both-edges]">
           {/* Gutters match the loaded column exactly (see its comment), so the
               skeleton doesn't reflow sideways when real content mounts. */}
-          <div className="mx-auto w-full max-w-4xl px-3 py-6 space-y-6 md:px-8 md:py-8">
+          <div
+            className={cn(
+              "mx-auto w-full px-3 py-6 space-y-6 md:px-8 md:py-8",
+              wideContent ? "max-w-none" : "max-w-4xl",
+            )}
+          >
             <Skeleton className="h-8 w-3/4" />
             <div className="space-y-2">
               <Skeleton className="h-4 w-full" />
@@ -1324,6 +1333,8 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
   });
   const sidebarRef = usePanelRef();
   const isMobile = useIsMobile();
+  const wideContent = useIssueDetailLayoutStore((s) => s.wideContent);
+  const toggleWideContent = useIssueDetailLayoutStore((s) => s.toggleWideContent);
   const desktopSidebarInitialOpen = getAnimatedRightSidebarInitialOpen(
     defaultSidebarOpen,
     defaultLayout,
@@ -3215,6 +3226,25 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
                 </Button>
               }
             />
+            {!isPeek && !isMobile && (
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <Button
+                      variant={wideContent ? "secondary" : "ghost"}
+                      size="icon-sm"
+                      className={wideContent ? "" : "text-muted-foreground"}
+                      aria-pressed={wideContent}
+                      aria-label={t(($) => $.detail.wide_layout_tooltip)}
+                      onClick={toggleWideContent}
+                    >
+                      {wideContent ? <FoldHorizontal /> : <UnfoldHorizontal />}
+                    </Button>
+                  }
+                />
+                <TooltipContent side="bottom">{t(($) => $.detail.wide_layout_tooltip)}</TooltipContent>
+              </Tooltip>
+            )}
             {isPeek ? (
               trailingActions
             ) : (
@@ -3260,7 +3290,12 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
             "mx-auto w-full",
             // The peek is already a narrow column, so it takes a tighter gutter
             // and never reaches the chat launcher's corner (see IssuePeekHost).
-            isPeek ? "px-6 py-5" : "max-w-4xl px-3 py-6 max-md:pb-chat-launcher md:px-8 md:py-8",
+            isPeek
+              ? "px-6 py-5"
+              : cn(
+                  "px-3 py-6 max-md:pb-chat-launcher md:px-8 md:py-8",
+                  wideContent ? "max-w-none" : "max-w-4xl",
+                ),
           )}
         >
           <IssueDuplicateBanner

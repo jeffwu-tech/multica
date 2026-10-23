@@ -68,6 +68,7 @@ export {
   getIssueSurfaceViewStateRegistrySnapshot,
 } from "./surface-view-store";
 export { useSubIssuesCollapseStore } from "./sub-issues-collapse-store";
+export { useIssueDetailLayoutStore } from "./issue-detail-layout-store";
 export {
   useSubIssueDisplayStore,
   SUB_ISSUE_ROW_PROPERTY_KEYS,

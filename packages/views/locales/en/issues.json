@@ -471,6 +471,7 @@
     "thread_nav_resolved_label": "{{title}} (resolved)",
     "thread_nav_reply_label": "{{author}}: {{title}}",
     "sidebar_tooltip": "Toggle right sidebar",
+    "wide_layout_tooltip": "Toggle wide layout",
     "find": {
       "placeholder": "Find in issue...",
       "count": "{{current}}/{{total}}",

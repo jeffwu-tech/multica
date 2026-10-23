@@ -13,6 +13,7 @@ import {
   DEFAULT_SUB_ISSUE_ROW_PROPERTIES,
   useSubIssueDisplayStore,
 } from "@multica/core/issues/stores/sub-issue-display-store";
+import { useIssueDetailLayoutStore } from "@multica/core/issues/stores/issue-detail-layout-store";
 import enAgents from "../../locales/en/agents.json";
 import enCommon from "../../locales/en/common.json";
 import enIssues from "../../locales/en/issues.json";
@@ -376,6 +377,10 @@ vi.mock("@multica/core/issues/stores", async () => ({
   ...(await vi.importActual<
     typeof import("@multica/core/issues/stores/sub-issues-collapse-store")
   >("@multica/core/issues/stores/sub-issues-collapse-store")),
+  // Real store: the wide-layout test toggles it through the header button.
+  ...(await vi.importActual<
+    typeof import("@multica/core/issues/stores/issue-detail-layout-store")
+  >("@multica/core/issues/stores/issue-detail-layout-store")),
   useRecentIssuesStore: Object.assign(
     (selector?: any) => {
       const state = { byWorkspace: {}, recordVisit: mockRecordVisit, pruneWorkspaces: vi.fn() };
@@ -514,6 +519,7 @@ beforeEach(() => {
   // useState); reset so one test's expansions can't leak into the next.
   useResolvedExpandStore.setState({ expandedByIssue: {} });
   useCommentCollapseStore.setState({ collapsedByIssue: {} });
+  useIssueDetailLayoutStore.setState({ wideContent: false });
 });
 
 // Mock modals
@@ -866,6 +872,23 @@ describe("IssueDetail (shared)", () => {
     expect(skeletonGutters).toEqual(
       horizontalGutters(container.querySelector(".max-w-4xl")),
     );
+  });
+
+  it("toggles the content column between the reading cap and the wide layout", async () => {
+    const { container } = renderIssueDetail();
+    await waitFor(() => {
+      expect(screen.getByText("Implement authentication")).toBeInTheDocument();
+    });
+    expect(container.querySelector(".max-w-4xl")).not.toBeNull();
+
+    const toggle = screen.getByRole("button", { name: "Toggle wide layout" });
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
+    fireEvent.click(toggle);
+
+    expect(toggle).toHaveAttribute("aria-pressed", "true");
+    expect(container.querySelector(".max-w-4xl")).toBeNull();
+    expect(container.querySelector(".max-w-none.md\\:px-8")).not.toBeNull();
+    expect(useIssueDetailLayoutStore.getState().wideContent).toBe(true);
   });
 
   it("wires the description selection toolbar to annotation collection", async () => {
