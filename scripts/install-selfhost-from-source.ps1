@@ -14,7 +14,10 @@
            (docker-compose.selfhost.yml + docker-compose.selfhost.build.yml),
         4. builds multica.exe inside the same golang image the backend Dockerfile uses
            (no local Go toolchain needed) and installs it to %USERPROFILE%\.multica\bin,
-        5. runs `multica setup self-host` (login + daemon start), or restarts the daemon
+        5. sets the daemon's shared issue worktree settings as user environment
+           variables (MULTICA_WORKTREE_SHARE_PER_ISSUE=true and
+           MULTICA_WORKTREE_BRANCH_PREFIX=-WorktreeBranchPrefix), then runs
+           `multica setup self-host` (login + daemon start), or restarts the daemon
            when the CLI is already signed in to this server,
         6. with -AgentsSpec: picks (or creates) the workspace, waits for this machine's
            runtimes to register in it, and runs scripts\multica-agents.ps1 from the
@@ -43,6 +46,12 @@
 .PARAMETER SkipSetup
     Do not run `multica setup self-host` / restart the daemon at the end
     (also skips -AgentsSpec, which needs a signed-in CLI).
+
+.PARAMETER WorktreeBranchPrefix
+    Branch prefix for shared issue worktrees (e.g. JWU gives branches like
+    JWU/WI01234567). Saved as the user environment variable
+    MULTICA_WORKTREE_BRANCH_PREFIX; required on the first install, after that the
+    saved value is reused when omitted.
 
 .PARAMETER Force
     Discard local changes or unpushed commits on -Branch in an existing
@@ -74,15 +83,15 @@
     # Fresh machine (Windows PowerShell or PowerShell 7):
     $url = 'https://raw.githubusercontent.com/jeffwu-tech/multica/feat/shared-issue-worktree/scripts/install-selfhost-from-source.ps1'
     Invoke-WebRequest $url -OutFile .\install-selfhost-from-source.ps1
-    powershell -ExecutionPolicy Bypass -File .\install-selfhost-from-source.ps1
+    powershell -ExecutionPolicy Bypass -File .\install-selfhost-from-source.ps1 -WorktreeBranchPrefix JWU
 
 .EXAMPLE
-    # Update to the latest commit on the branch:
+    # Update to the latest commit on the branch (reuses the saved branch prefix):
     .\install-selfhost-from-source.ps1
 
 .EXAMPLE
     # Fresh server: install, create a workspace and recreate exported projects/agents:
-    .\install-selfhost-from-source.ps1 -AgentsSpec .\agents.json -WorkspaceName 'WiseTech Global' -WorkspaceSlug cargowise
+    .\install-selfhost-from-source.ps1 -WorktreeBranchPrefix JWU -AgentsSpec .\agents.json -WorkspaceName 'WiseTechGlobal' -WorkspaceSlug wtg
 
 .EXAMPLE
     # Stop the stack (data is kept):
@@ -94,6 +103,7 @@ param(
     [string] $Branch = 'feat/shared-issue-worktree',
     [string] $InstallDir = 'C:\git\GitHub\multica',
     [switch] $SkipSetup,
+    [string] $WorktreeBranchPrefix,
     [switch] $Force,
     [string] $AgentsSpec,
     [string] $WorkspaceId,
@@ -228,6 +238,42 @@ function Test-Prerequisites {
 
     # Checked up front so a missing pwsh does not surface only after a long build.
     if ($AgentsSpec -and -not $SkipSetup) { $script:AgentsShell = Get-AgentsShell }
+    $script:BranchPrefix = Resolve-WorktreeBranchPrefix
+}
+
+# The parameter wins; on re-runs the value saved by an earlier install is reused.
+# Validated here with the daemon's own rules, because a bad value stops the daemon
+# from starting at all.
+function Resolve-WorktreeBranchPrefix {
+    $prefix = $WorktreeBranchPrefix
+    if (-not $prefix) { $prefix = [Environment]::GetEnvironmentVariable('MULTICA_WORKTREE_BRANCH_PREFIX', 'User') }
+    if (-not $prefix) {
+        throw 'Pass -WorktreeBranchPrefix (e.g. -WorktreeBranchPrefix JWU) to name shared issue branches.'
+    }
+    foreach ($component in $prefix.Split('/')) {
+        if ($component -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$' -or $component.Contains('..') -or
+            $component.EndsWith('.') -or $component.EndsWith('.lock')) {
+            throw "Worktree branch prefix '$prefix' is not a valid git branch prefix (use letters, digits, '.', '_', '-' and '/' between components)."
+        }
+    }
+    return $prefix
+}
+
+# The daemon reads these when it starts. They are saved for the user so a later
+# manual `multica daemon start` keeps them, and set on this process so the daemon
+# this script starts or restarts picks them up immediately.
+function Set-DaemonEnvironment {
+    $settings = [ordered]@{
+        MULTICA_WORKTREE_SHARE_PER_ISSUE = 'true'
+        MULTICA_WORKTREE_BRANCH_PREFIX   = $script:BranchPrefix
+    }
+    foreach ($name in $settings.Keys) {
+        if ([Environment]::GetEnvironmentVariable($name, 'User') -ne $settings[$name]) {
+            [Environment]::SetEnvironmentVariable($name, $settings[$name], 'User')
+        }
+        Set-Item -Path "env:$name" -Value $settings[$name]
+    }
+    Write-Ok "Daemon environment: MULTICA_WORKTREE_SHARE_PER_ISSUE=true, MULTICA_WORKTREE_BRANCH_PREFIX=$script:BranchPrefix"
 }
 
 # multica-agents.ps1 needs PowerShell 7.3+. Returns $null when this process qualifies,
@@ -596,6 +642,7 @@ try {
     Start-Server
     Build-Cli
     Install-Cli
+    Set-DaemonEnvironment
     Connect-Cli
     try {
         Import-Agents
@@ -620,6 +667,7 @@ Write-Host '  Update:   re-run this script'
 Write-Host "  Logs:     $composeCmd logs -f backend"
 Write-Host "  Stop:     $composeCmd down   (data is kept)"
 Write-Host '  Daemon:   multica daemon status | start | stop'
+Write-Host "  Worktree: shared per issue, branches $script:BranchPrefix/<work item or issue key>"
 if ($SkipSetup) {
     Write-Host ''
     Write-Host "  Next:     multica setup self-host --port $script:BackendPort --frontend-port $script:FrontendPort"
