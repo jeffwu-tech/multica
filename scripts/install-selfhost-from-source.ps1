@@ -36,15 +36,17 @@
     Branch to build.
 
 .PARAMETER InstallDir
-    Where the source checkout, .env and compose project live.
+    Where the source checkout, .env and compose project live. An existing checkout
+    (e.g. a dev clone whose origin is upstream) is reused: the script fetches from
+    whichever remote points at -RepoUrl, adding a 'fork' remote if none does.
 
 .PARAMETER SkipSetup
     Do not run `multica setup self-host` / restart the daemon at the end
     (also skips -AgentsSpec, which needs a signed-in CLI).
 
 .PARAMETER Force
-    Discard local changes in an existing -InstallDir checkout, or replace a
-    non-git -InstallDir.
+    Discard local changes or unpushed commits on -Branch in an existing
+    -InstallDir checkout, or replace a non-git -InstallDir.
 
 .PARAMETER AgentsSpec
     Spec written by `multica-agents.ps1 -Export` (e.g. .\agents.json). Its
@@ -80,13 +82,13 @@
 
 .EXAMPLE
     # Stop the stack (data is kept):
-    docker compose -f "$env:USERPROFILE\.multica\server\docker-compose.selfhost.yml" down
+    docker compose -f "C:\git\GitHub\multica\docker-compose.selfhost.yml" down
 #>
 [CmdletBinding()]
 param(
     [string] $RepoUrl = 'https://github.com/jeffwu-tech/multica.git',
     [string] $Branch = 'feat/shared-issue-worktree',
-    [string] $InstallDir = (Join-Path $env:USERPROFILE '.multica\server'),
+    [string] $InstallDir = 'C:\git\GitHub\multica',
     [switch] $SkipSetup,
     [switch] $Force,
     [string] $AgentsSpec,
@@ -263,6 +265,29 @@ function Test-BaseImages {
 
 # ------------------------------------------------------------------- Source ----
 
+function Get-RepoKey {
+    # Compares remotes regardless of https/ssh form, case or a trailing .git.
+    param([string] $Url)
+    if (-not $Url) { return '' }
+    $key = $Url.Trim().ToLowerInvariant() -replace '^[a-z+]+://', '' -replace '^[^@/]+@', '' -replace '\.git/?$', ''
+    return ($key -replace '^([^/:]+):', '$1/').TrimEnd('/')
+}
+
+# Remote in an existing checkout that points at -RepoUrl; adds one when none does.
+# Existing remotes (e.g. origin -> upstream in a dev checkout) are never rewritten.
+function Get-SourceRemote {
+    $wanted = Get-RepoKey $RepoUrl
+    $remotes = @((Get-Output 'git' @('-C', $InstallDir, 'remote')) -split "`n" | Where-Object { $_ })
+    foreach ($remote in $remotes) {
+        if ((Get-RepoKey (Get-Output 'git' @('-C', $InstallDir, 'remote', 'get-url', $remote))) -eq $wanted) { return $remote }
+    }
+    $name = @('fork', 'multica-install') | Where-Object { $remotes -notcontains $_ } | Select-Object -First 1
+    if (-not $name) { throw "No remote in $InstallDir points at $RepoUrl. Add one with: git remote add <name> $RepoUrl" }
+    Write-Step "Adding remote '$name' -> $RepoUrl"
+    $null = Invoke-Step 'git' @('-C', $InstallDir, 'remote', 'add', $name, $RepoUrl)
+    return $name
+}
+
 function Sync-Source {
     if (Test-Path (Join-Path $InstallDir '.git')) {
         Write-Step "Updating $InstallDir to $RepoUrl @ $Branch"
@@ -270,18 +295,22 @@ function Sync-Source {
         if ($dirty -and -not $Force) {
             throw "$InstallDir has local changes. Commit/stash them, or re-run with -Force to discard them."
         }
-        $origin = Get-Output 'git' @('-C', $InstallDir, 'remote', 'get-url', 'origin') -AllowFailure
-        if ($origin -ne $RepoUrl) {
-            Write-Warning "Switching origin from '$origin' to '$RepoUrl'."
-            $null = Invoke-Step 'git' @('-C', $InstallDir, 'remote', 'set-url', 'origin', $RepoUrl)
-        }
+        $remote = Get-SourceRemote
         # Earlier installs (scripts/install.ps1) clone shallowly; version stamping needs history + tags.
         if ((Get-Output 'git' @('-C', $InstallDir, 'rev-parse', '--is-shallow-repository')) -eq 'true') {
-            $null = Invoke-Step 'git' @('-C', $InstallDir, 'fetch', '--quiet', '--unshallow', '--filter=blob:none', 'origin')
+            $null = Invoke-Step 'git' @('-C', $InstallDir, 'fetch', '--quiet', '--unshallow', '--filter=blob:none', $remote)
         }
-        $null = Invoke-Step 'git' @('-C', $InstallDir, 'fetch', '--quiet', '--tags', '--force', 'origin',
-            "+refs/heads/${Branch}:refs/remotes/origin/${Branch}")
-        $null = Invoke-Step 'git' @('-C', $InstallDir, 'checkout', '--quiet', '--force', '-B', $Branch, "origin/$Branch")
+        $null = Invoke-Step 'git' @('-C', $InstallDir, 'fetch', '--quiet', '--tags', '--force', $remote,
+            "+refs/heads/${Branch}:refs/remotes/${remote}/${Branch}")
+
+        $localBranch = Get-Output 'git' @('-C', $InstallDir, 'rev-parse', '--verify', '--quiet', "refs/heads/$Branch") -AllowFailure
+        if ($localBranch -and -not $Force) {
+            $ahead = [int] (Get-Output 'git' @('-C', $InstallDir, 'rev-list', '--count', "$remote/$Branch..$Branch"))
+            if ($ahead -gt 0) {
+                throw "Local branch '$Branch' has $ahead commit(s) that are not on $remote. Push them first, or re-run with -Force to reset it to $remote/$Branch."
+            }
+        }
+        $null = Invoke-Step 'git' @('-C', $InstallDir, 'checkout', '--quiet', '--force', '-B', $Branch, "$remote/$Branch")
     } else {
         if ((Test-Path $InstallDir) -and @(Get-ChildItem -LiteralPath $InstallDir -Force).Count -gt 0) {
             if (-not $Force) { throw "$InstallDir exists and is not a git checkout. Re-run with -Force to replace it." }
