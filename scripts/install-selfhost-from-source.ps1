@@ -72,9 +72,6 @@
 .PARAMETER WorkspaceSlug
     Slug for -WorkspaceName. Defaults to the name in lower-case with dashes.
 
-.PARAMETER AgentsPathMap
-    Passed to multica-agents.ps1 -PathMap, e.g. @{ 'C:\git\GitHub' = 'D:\src' }.
-
 .PARAMETER PauseAutopilots
     Passed to multica-agents.ps1: create imported autopilots paused, so they do not
     run on both the old and the new machine.
@@ -109,7 +106,6 @@ param(
     [string] $WorkspaceId,
     [string] $WorkspaceName,
     [string] $WorkspaceSlug,
-    [hashtable] $AgentsPathMap = @{},
     [switch] $PauseAutopilots
 )
 
@@ -616,7 +612,6 @@ function Import-Agents {
 
     Write-Step "Creating projects, agents, skills and autopilots from $AgentsSpec"
     $params = @{ Path = $AgentsSpec; WorkspaceId = $script:AgentsWorkspaceId }
-    if ($AgentsPathMap.Count -gt 0) { $params.PathMap = $AgentsPathMap }
     if ($PauseAutopilots) { $params.PauseAutopilots = $true }
     if ($script:AgentsShell) {
         & $script:AgentsShell -NoProfile -Command {
