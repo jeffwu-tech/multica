@@ -201,6 +201,14 @@ function Get-SecretsPath {
     return Join-Path $dir "$base.secrets.json"
 }
 
+# The daemon names runtimes "<display name> (<device name>)"; dropping the machine
+# part keeps the spec portable and comparable across machines.
+function Get-RuntimeBaseName {
+    param([string] $Name)
+    if (-not $Name) { return $null }
+    return $Name -replace '\s+\([^()]*\)$', ''
+}
+
 # ---------------------------------------------------------- Placeholders ----
 
 $UuidPattern = '(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b'
@@ -478,7 +486,7 @@ function Export-Agents {
                 [ordered]@{ label = $_.label; prompt = ConvertTo-Placeholders $_.prompt "$($a.name) conversation starter" }
             })
             provider              = if ($rt) { $rt.provider } else { $null }
-            source_runtime_name   = if ($rt) { $rt.name } else { $null }
+            runtime_name          = if ($rt) { Get-RuntimeBaseName $rt.name } else { $null }
             model                 = Get-Prop $a 'model'
             thinking_level        = Get-Prop $a 'thinking_level'
             service_tier          = Get-Prop $a 'service_tier'
@@ -588,7 +596,8 @@ function Select-RuntimeId {
     if ($candidates.Count -eq 0) { return $null }
     if ($candidates.Count -eq 1) { return $candidates[0].id }
 
-    $byName = $candidates | Where-Object { $_.name -eq (Get-Prop $Agent 'source_runtime_name') } | Select-Object -First 1
+    $wanted = Get-Prop $Agent 'runtime_name'
+    $byName = $candidates | Where-Object { $wanted -and (Get-RuntimeBaseName $_.name) -eq $wanted } | Select-Object -First 1
     if ($byName) { return $byName.id }
     $plain = $candidates | Where-Object { -not (Get-Prop $_ 'profile_id') } | Select-Object -First 1
     if ($plain) { return $plain.id }
