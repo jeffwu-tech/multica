@@ -18,7 +18,7 @@
            when the CLI is already signed in to this server,
         6. with -AgentsSpec: picks (or creates) the workspace, waits for this machine's
            runtimes to register in it, and runs scripts\multica-agents.ps1 from the
-           checkout to create the exported projects, agents and skills there.
+           checkout to create the exported projects, agents, skills and autopilots there.
 
     Re-run the script to update: it pulls the branch, rebuilds and restarts everything.
     Database data lives in the Docker volume and survives updates.
@@ -66,6 +66,10 @@
 .PARAMETER AgentsPathMap
     Passed to multica-agents.ps1 -PathMap, e.g. @{ 'C:\git\GitHub' = 'D:\src' }.
 
+.PARAMETER PauseAutopilots
+    Passed to multica-agents.ps1: create imported autopilots paused, so they do not
+    run on both the old and the new machine.
+
 .EXAMPLE
     # Fresh machine (Windows PowerShell or PowerShell 7):
     $url = 'https://raw.githubusercontent.com/jeffwu-tech/multica/feat/shared-issue-worktree/scripts/install-selfhost-from-source.ps1'
@@ -95,7 +99,8 @@ param(
     [string] $WorkspaceId,
     [string] $WorkspaceName,
     [string] $WorkspaceSlug,
-    [hashtable] $AgentsPathMap = @{}
+    [hashtable] $AgentsPathMap = @{},
+    [switch] $PauseAutopilots
 )
 
 $ErrorActionPreference = 'Stop'
@@ -563,9 +568,10 @@ function Import-Agents {
     $script:AgentsWorkspaceId = Resolve-Workspace
     Wait-LocalRuntimes $script:AgentsWorkspaceId
 
-    Write-Step "Creating projects, agents and skills from $AgentsSpec"
+    Write-Step "Creating projects, agents, skills and autopilots from $AgentsSpec"
     $params = @{ Path = $AgentsSpec; WorkspaceId = $script:AgentsWorkspaceId }
     if ($AgentsPathMap.Count -gt 0) { $params.PathMap = $AgentsPathMap }
+    if ($PauseAutopilots) { $params.PauseAutopilots = $true }
     if ($script:AgentsShell) {
         & $script:AgentsShell -NoProfile -Command {
             param($ScriptPath, $Params)
@@ -576,7 +582,7 @@ function Import-Agents {
         & $agentsScript @params
     }
     if ($LASTEXITCODE -ne 0) { throw "multica-agents.ps1 reported failures (exit code $LASTEXITCODE)." }
-    Write-Ok 'Projects, agents and skills are in place'
+    Write-Ok 'Projects, agents, skills and autopilots are in place'
 }
 
 # --------------------------------------------------------------------- Main ----

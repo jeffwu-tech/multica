@@ -1,20 +1,25 @@
 #Requires -Version 7.3
 <#
 .SYNOPSIS
-    Export Multica projects, agents and skills to a JSON spec, or create them from
-    that spec on this machine.
+    Export Multica projects, agents, skills and autopilots to a JSON spec, or create
+    them from that spec on this machine.
 
 .DESCRIPTION
-    Export mode (-Export) reads every project in the workspace, every active,
-    user-authored agent (or those matching -Name) and the skills assigned to them,
-    and writes:
-        <Path>                  project + agent + skill definitions
+    Export mode (-Export) reads every project and autopilot in the workspace, every
+    active, user-authored agent (or those matching -Name) and the skills assigned to
+    them, and writes:
+        <Path>                  project + agent + skill + autopilot definitions
         <name>.secrets.json     custom_env and mcp_config per agent (only with -IncludeSecrets;
                                 keep this file private and out of source control)
 
     Projects keep their title, description, icon, status, dates, lead (by name) and
     resources. local_directory resources are re-bound to THIS machine's daemon on
     create; use -PathMap when checkouts live somewhere else on the new machine.
+
+    Autopilots keep their title, prompt (description), assignee agent (by name),
+    mode, project (by title), issue title template, status, subscribers (by email)
+    and triggers (schedule cron/timezone/label/enabled; webhook triggers get a NEW
+    URL and token on create).
 
     Workspace IDs in instructions, descriptions, conversation starters and skill
     content are exported as name-based placeholders, because every ID differs in
@@ -32,9 +37,13 @@
         3. creates each skill that does not exist yet (matched by name),
         4. assigns skills, uploads avatars, sets project leads, and replaces placeholders
            with the target IDs - including agents created by an earlier run whose
-           placeholders could not be resolved then (e.g. a project created later).
-    Existing projects, agents and skills are otherwise left alone, so the script is
-    safe to re-run. Placeholders that cannot be resolved stay in the text and are reported.
+           placeholders could not be resolved then (e.g. a project created later),
+        5. creates each autopilot that does not exist yet (matched by title) with its
+           triggers. Use -PauseAutopilots while the old machine is still running them,
+           so both do not act on the same schedule.
+    Existing projects, agents, skills and autopilots are otherwise left alone, so the
+    script is safe to re-run. Placeholders that cannot be resolved stay in the text and
+    are reported.
 
     Before running Create on the new machine:
         - install the agent CLIs (claude, codex, ...) and sign in to them,
@@ -43,8 +52,9 @@
         - clone the repositories that project local_directory resources point to.
 
     Not migrated: project priority and workflow, issues, member/team invocation
-    targets, Composio toolkit allow-lists, disabled runtime skills, run history,
-    chat sessions, and local work directories.
+    targets, Composio toolkit allow-lists, disabled runtime skills, run history
+    (agents and autopilots), webhook trigger URLs/secrets, chat sessions, and local
+    work directories.
 
 .PARAMETER Export
     Export from the workspace instead of creating.
@@ -67,6 +77,11 @@
 
 .PARAMETER PathMap
     Create: rewrite local_directory path prefixes, e.g. @{ 'C:\git\GitHub' = 'D:\src' }.
+
+.PARAMETER PauseAutopilots
+    Create: create autopilots paused regardless of their exported status. Resume them
+    in the UI (or `multica autopilot update <id> --status active`) once the old
+    machine's copies are paused.
 
 .PARAMETER MulticaProfile
     Passed to the CLI as --profile.
@@ -112,6 +127,9 @@ param(
 
     [Parameter(ParameterSetName = 'Create')]
     [hashtable] $PathMap = @{},
+
+    [Parameter(ParameterSetName = 'Create')]
+    [switch] $PauseAutopilots,
 
     [string] $MulticaProfile,
     [string] $WorkspaceId,
@@ -347,6 +365,62 @@ function Export-Projects {
     }
 }
 
+function Export-Autopilots {
+    param([object[]] $AllAgents, [object[]] $Projects, [object[]] $Members)
+
+    $list = Invoke-Multica @('autopilot', 'list', '--output', 'json')
+    foreach ($ap in @(Get-Prop $list 'autopilots')) {
+        $title = $ap.title
+        Write-Host "Exporting autopilot '$title'"
+
+        $assignee = $null
+        if ((Get-Prop $ap 'assignee_type') -eq 'agent') {
+            $assignee = @($AllAgents | Where-Object { $_.id -eq $ap.assignee_id } | ForEach-Object { $_.name })[0]
+        }
+        if (-not $assignee) {
+            Write-Warning "Autopilot '$title': assignee $($ap.assignee_type) $($ap.assignee_id) not found; it will be skipped on create."
+        }
+
+        $projectTitle = $null
+        $projectId = Get-Prop $ap 'project_id'
+        if ($projectId) {
+            $projectTitle = @($Projects | Where-Object { $_.id -eq $projectId } | ForEach-Object { $_.title })[0]
+            if (-not $projectTitle) { Write-Warning "Autopilot '$title': project $projectId not found; it is exported without a project." }
+        }
+
+        $subscribers = foreach ($s in @(Get-Prop $ap 'subscribers')) {
+            $email = @($Members | Where-Object { $_.user_id -eq $s.user_id } | ForEach-Object { Get-Prop $_ 'email' })[0]
+            if ($email) { $email } else { Write-Warning "Autopilot '$title': subscriber $($s.user_id) has no email; not exported." }
+        }
+
+        $triggerList = Invoke-Multica @('autopilot', 'trigger-list', $ap.id, '--output', 'json')
+        $triggers = foreach ($t in @(Get-Prop $triggerList 'triggers')) {
+            if ($t.kind -eq 'webhook') {
+                Write-Warning "Autopilot '$title': its webhook trigger gets a NEW URL and token on create; update whatever calls it."
+            }
+            [ordered]@{
+                kind     = $t.kind
+                cron     = Get-Prop $t 'cron_expression'
+                timezone = Get-Prop $t 'timezone'
+                label    = Get-Prop $t 'label'
+                enabled  = [bool] $t.enabled
+            }
+        }
+
+        [ordered]@{
+            title                = $title
+            description          = ConvertTo-Placeholders (Get-Prop $ap 'description') "autopilot $title description"
+            assignee             = $assignee
+            mode                 = $ap.execution_mode
+            project              = $projectTitle
+            issue_title_template = Get-Prop $ap 'issue_title_template'
+            status               = Get-Prop $ap 'status'
+            subscribers          = @($subscribers)
+            triggers             = @($triggers)
+        }
+    }
+}
+
 function Export-Agents {
     $runtimeById = @{}
     foreach ($r in @(Invoke-Multica @('runtime', 'list', '--output', 'json'))) { $runtimeById[$r.id] = $r }
@@ -452,6 +526,8 @@ function Export-Agents {
         }
     }
 
+    $specAutopilots = @(Export-Autopilots $allAgents $projects $members)
+
     foreach ($u in $script:UnknownIds) {
         Write-Warning "Unrecognised ID left as-is in $u"
     }
@@ -462,9 +538,10 @@ function Export-Agents {
         projects    = $specProjects
         skills      = @($specSkills)
         agents      = $specAgents
+        autopilots  = $specAutopilots
     }
 
-    $summary = "$($specProjects.Count) project(s), $($specAgents.Count) agent(s) and $(@($specSkills).Count) skill(s)"
+    $summary = "$($specProjects.Count) project(s), $($specAgents.Count) agent(s), $(@($specSkills).Count) skill(s) and $($specAutopilots.Count) autopilot(s)"
     if ($PSCmdlet.ShouldProcess($Path, "Write spec with $summary")) {
         Write-Utf8File $Path (ConvertTo-Json -InputObject $spec -Depth 100)
         Write-Host "Wrote $summary to $Path" -ForegroundColor Green
@@ -802,6 +879,93 @@ function Complete-Projects {
     }
 }
 
+function Sync-Autopilots {
+    param($Autopilots)
+
+    $existing = @{}
+    foreach ($ap in @(Get-Prop (Invoke-Multica @('autopilot', 'list', '--output', 'json')) 'autopilots')) { $existing[$ap.title] = $ap.id }
+
+    foreach ($ap in @($Autopilots | Where-Object { $_ })) {
+        $title = $ap.title
+        if ($existing.ContainsKey($title)) {
+            Write-Host "Autopilot '$title' already exists - skipped."
+            continue
+        }
+        $assignee = Get-Prop $ap 'assignee'
+        $triggers = @(Get-Prop $ap 'triggers')
+        $paused = $PauseAutopilots -or (Get-Prop $ap 'status') -eq 'paused'
+        $what = "autopilot '$title' -> $assignee with $($triggers.Count) trigger(s)" + $(if ($paused) { ' (paused)' } else { '' })
+        if (-not $PSCmdlet.ShouldProcess($what, 'Create')) { continue }
+
+        if (-not $assignee -or -not $script:Target.agents.ContainsKey($assignee)) {
+            Write-Warning "Autopilot '$title': assignee agent '$assignee' does not exist in the target workspace; skipped."
+            $script:Failed++
+            continue
+        }
+
+        $description = Resolve-Placeholders (Get-Prop $ap 'description')
+        $cliArgs = @('autopilot', 'create', '--title', $title, '--agent', $script:Target.agents[$assignee],
+            '--mode', $ap.mode, '--output', 'json')
+        if ($description) { $cliArgs += @('--description', $description) }
+        $project = Get-Prop $ap 'project'
+        if ($project) {
+            if ($script:Target.projects.ContainsKey($project)) { $cliArgs += @('--project', $script:Target.projects[$project]) }
+            else { Write-Warning "Autopilot '$title': project '$project' not found; created without a project." }
+        }
+        if (Get-Prop $ap 'issue_title_template') { $cliArgs += @('--issue-title-template', $ap.issue_title_template) }
+        foreach ($email in @(Get-Prop $ap 'subscribers')) {
+            $userId = $script:Target.users[$email]
+            if ($userId) { $cliArgs += @('--subscriber', $userId) }
+            else { Write-Warning "Autopilot '$title': subscriber $email is not a member of the target workspace; skipped." }
+        }
+        if (-not (Test-CommandLength $cliArgs "Autopilot '$title'")) { $script:Failed++; continue }
+
+        try {
+            $new = Invoke-Multica $cliArgs
+        } catch {
+            Write-Warning "Autopilot '$title': $($_.Exception.Message)"
+            $script:Failed++
+            continue
+        }
+        $script:AutopilotsCreated++
+        Write-Host "Created autopilot '$title' ($($new.id))" -ForegroundColor Green
+
+        try {
+            # Pause before adding triggers so a schedule cannot fire in between.
+            if ($paused) { $null = Invoke-Multica @('autopilot', 'update', $new.id, '--status', 'paused', '--output', 'json') }
+
+            foreach ($t in $triggers) {
+                $triggerArgs = @('autopilot', 'trigger-add', $new.id, '--kind', $t.kind, '--output', 'json')
+                if ($t.kind -eq 'schedule') {
+                    $triggerArgs += @('--cron', $t.cron)
+                    if (Get-Prop $t 'timezone') { $triggerArgs += @('--timezone', $t.timezone) }
+                } elseif ($t.kind -ne 'webhook') {
+                    Write-Warning "Autopilot '$title': unsupported trigger kind '$($t.kind)'; skipped."
+                    continue
+                }
+                if (Get-Prop $t 'label') { $triggerArgs += @('--label', $t.label) }
+                $trigger = Invoke-Multica $triggerArgs
+                if (-not $t.enabled) {
+                    $null = Invoke-Multica @('autopilot', 'trigger-update', $new.id, $trigger.id, '--enabled=false', '--output', 'json')
+                }
+                $state = if ($t.enabled) { 'enabled' } else { 'disabled' }
+                Write-Host "  + $($t.kind) trigger $(if ($t.kind -eq 'schedule') { "'$($t.cron)' $($t.timezone) " })($state)"
+                if ($t.kind -eq 'webhook') {
+                    Write-Warning "Autopilot '$title': new webhook URL/token - copy it from the autopilot's trigger settings to its callers."
+                }
+            }
+        } catch {
+            Write-Warning "Autopilot '$title': could not finish status/triggers ($($_.Exception.Message)). Fix it in the UI."
+            $script:Failed++
+        }
+
+        $left = @(Get-Placeholders @($description))
+        if ($left.Count -gt 0) {
+            Write-Warning "Autopilot '$title': unresolved placeholders $($left -join ', ') in its prompt."
+        }
+    }
+}
+
 function New-Agents {
     if (-not (Test-Path $Path)) { throw "Spec file not found: $Path" }
     $spec = Get-Content -Raw -Encoding utf8 $Path | ConvertFrom-Json -Depth 100
@@ -818,6 +982,7 @@ function New-Agents {
     $script:Target = Get-TargetIndex
     $script:Failed = 0
     $script:ProjectsCreated = 0
+    $script:AutopilotsCreated = 0
 
     # Pass 1: projects.
     $projectsCreatedNow = Sync-Projects (Get-Prop $spec 'projects')
@@ -892,8 +1057,11 @@ function New-Agents {
     }
     Complete-Projects (Get-Prop $spec 'projects') $projectsCreatedNow
 
+    # Pass 5: autopilots, now that their agents, projects and placeholders resolve.
+    Sync-Autopilots (Get-Prop $spec 'autopilots')
+
     Write-Host ''
-    Write-Host "Done. Projects created: $script:ProjectsCreated  Agents created: $created  Agents skipped (already exist): $skipped  Failures: $script:Failed"
+    Write-Host "Done. Projects created: $script:ProjectsCreated  Agents created: $created  Agents skipped (already exist): $skipped  Autopilots created: $script:AutopilotsCreated  Failures: $script:Failed"
     if ($script:Failed -gt 0) { exit 1 }
 }
 
