@@ -9,7 +9,8 @@
     script builds every component from source so changes on a branch are included:
 
         1. clones (or fast-forwards) -RepoUrl @ -Branch into -InstallDir,
-        2. creates .env with random secrets on first run (existing .env is kept),
+        2. creates .env with random secrets and telemetry opted out (DO_NOT_TRACK,
+           ANALYTICS_DISABLED) on first run; an existing .env is kept,
         3. builds the backend and web images and starts the stack
            (docker-compose.selfhost.yml + docker-compose.selfhost.build.yml),
         4. builds multica.exe inside the same golang image the backend Dockerfile uses
@@ -76,6 +77,12 @@
     Passed to multica-agents.ps1: create imported autopilots paused, so they do not
     run on both the old and the new machine.
 
+.PARAMETER DevVerificationCode
+    Fixed 6-digit login code (MULTICA_DEV_VERIFICATION_CODE) so sign-in does not need
+    the code from the backend log. Also sets APP_ENV=development, which the backend
+    requires for a fixed code; only use it on a server nobody else can reach.
+    Written to .env (also on re-runs, recreating the containers).
+
 .EXAMPLE
     # Fresh machine (Windows PowerShell or PowerShell 7):
     $url = 'https://raw.githubusercontent.com/jeffwu-tech/multica/feat/shared-issue-worktree/scripts/install-selfhost-from-source.ps1'
@@ -106,7 +113,8 @@ param(
     [string] $WorkspaceId,
     [string] $WorkspaceName,
     [string] $WorkspaceSlug,
-    [switch] $PauseAutopilots
+    [switch] $PauseAutopilots,
+    [string] $DevVerificationCode
 )
 
 $ErrorActionPreference = 'Stop'
@@ -235,6 +243,9 @@ function Test-Prerequisites {
     # Checked up front so a missing pwsh does not surface only after a long build.
     if ($AgentsSpec -and -not $SkipSetup) { $script:AgentsShell = Get-AgentsShell }
     $script:BranchPrefix = Resolve-WorktreeBranchPrefix
+    if ($DevVerificationCode -and $DevVerificationCode -notmatch '^\d{6}$') {
+        throw '-DevVerificationCode must be exactly 6 digits.'
+    }
 }
 
 # The parameter wins; on re-runs the value saved by an earlier install is reused.
@@ -383,10 +394,44 @@ function Sync-Source {
 
 # ---------------------------------------------------------------------- Env ----
 
+# Settings from parameters; only the ones that apply. A fixed login code needs a
+# non-production APP_ENV, because the backend ignores it in production.
+function Get-EnvSettings {
+    $settings = [ordered]@{}
+    if ($DevVerificationCode) {
+        $settings['APP_ENV'] = 'development'
+        $settings['MULTICA_DEV_VERIFICATION_CODE'] = $DevVerificationCode
+    }
+    return $settings
+}
+
+# Replaces KEY=... lines in place and appends keys the file does not have yet.
+function Set-EnvFileValues {
+    param([string] $EnvPath, [System.Collections.IDictionary] $Values)
+    $pending = [ordered]@{}
+    foreach ($key in $Values.Keys) { $pending[$key] = $Values[$key] }
+    $lines = foreach ($line in [System.IO.File]::ReadAllLines($EnvPath)) {
+        if ($line -match '^([A-Z0-9_]+)=' -and $pending.Contains($Matches[1])) {
+            "$($Matches[1])=$($pending[$Matches[1]])"
+            $pending.Remove($Matches[1])
+        } else {
+            $line
+        }
+    }
+    $lines = @($lines) + @($pending.Keys | ForEach-Object { "$_=$($pending[$_])" })
+    Write-Utf8Lines $EnvPath $lines
+}
+
 function Initialize-EnvFile {
     $envPath = Join-Path $InstallDir '.env'
+    $settings = Get-EnvSettings
     if (Test-Path $envPath) {
-        Write-Ok 'Using existing .env'
+        if ($settings.Count -gt 0) {
+            Set-EnvFileValues $envPath $settings
+            Write-Ok "Updated existing .env: $($settings.Keys -join ', ')"
+        } else {
+            Write-Ok 'Using existing .env'
+        }
         return
     }
     Write-Step 'Creating .env with random secrets'
@@ -401,7 +446,12 @@ function Initialize-EnvFile {
         else { $line }
     }
     Write-Utf8Lines $envPath $lines
-    Write-Ok 'Generated JWT_SECRET, POSTGRES_PASSWORD and MULTICA_VCS_SECRET_KEY'
+
+    # Opt out of telemetry by default on these private installs.
+    $defaults = [ordered]@{ DO_NOT_TRACK = 'true'; ANALYTICS_DISABLED = 'true' }
+    foreach ($key in $settings.Keys) { $defaults[$key] = $settings[$key] }
+    Set-EnvFileValues $envPath $defaults
+    Write-Ok "Generated JWT_SECRET, POSTGRES_PASSWORD and MULTICA_VCS_SECRET_KEY; set $($defaults.Keys -join ', ')"
 }
 
 # ------------------------------------------------------------------- Server ----
@@ -530,7 +580,11 @@ function Connect-Cli {
 
     Write-Step 'Connecting the CLI: a browser opens for sign-in'
     $envText = [System.IO.File]::ReadAllText((Join-Path $InstallDir '.env'))
-    if ($envText -notmatch '(?m)^RESEND_API_KEY=\S') {
+    $fixedCode = $envText -match '(?m)^MULTICA_DEV_VERIFICATION_CODE=\d{6}\s*$' -and
+        $envText -match '(?m)^APP_ENV=(?!production\s*$)\S'
+    if ($fixedCode) {
+        Write-Host '    Sign in with the fixed code from MULTICA_DEV_VERIFICATION_CODE in .env.'
+    } elseif ($envText -notmatch '(?m)^RESEND_API_KEY=\S') {
         Write-Host '    No RESEND_API_KEY is set, so login codes are not emailed.'
         Write-Host '    A second window will show them as they are issued.'
         Open-LoginCodeWindow
