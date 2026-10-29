@@ -13,8 +13,8 @@
                                 keep this file private and out of source control)
 
     Projects keep their title, description, icon, status, dates, lead (by name) and
-    resources. local_directory resources are re-bound to THIS machine's daemon on
-    create; use -PathMap when checkouts live somewhere else on the new machine.
+    resources. local_directory resources keep their exported path and are re-bound to
+    THIS machine's daemon on create, so clone the repositories to the same paths.
 
     Autopilots keep their title, prompt (description), assignee agent (by name),
     mode, project (by title), issue title template, status, subscribers (by email)
@@ -75,9 +75,6 @@
 .PARAMETER RuntimeId
     Create: bind every agent to this runtime ID, ignoring providers.
 
-.PARAMETER PathMap
-    Create: rewrite local_directory path prefixes, e.g. @{ 'C:\git\GitHub' = 'D:\src' }.
-
 .PARAMETER PauseAutopilots
     Create: create autopilots paused regardless of their exported status. Resume them
     in the UI (or `multica autopilot update <id> --status active`) once the old
@@ -100,10 +97,6 @@
     # New machine, against the target workspace. Preview first, then apply:
     ./multica-agents.ps1 -Path .\agents.json -WorkspaceId <target-workspace-id> -WhatIf
     ./multica-agents.ps1 -Path .\agents.json -WorkspaceId <target-workspace-id>
-
-.EXAMPLE
-    # Repositories are cloned under D:\src on the new machine:
-    ./multica-agents.ps1 -Path .\agents.json -PathMap @{ 'C:\git\GitHub\WiseTechGlobal' = 'D:\src' }
 #>
 [CmdletBinding(SupportsShouldProcess, DefaultParameterSetName = 'Create')]
 param(
@@ -124,9 +117,6 @@ param(
 
     [Parameter(ParameterSetName = 'Create')]
     [string] $RuntimeId,
-
-    [Parameter(ParameterSetName = 'Create')]
-    [hashtable] $PathMap = @{},
 
     [Parameter(ParameterSetName = 'Create')]
     [switch] $PauseAutopilots,
@@ -778,20 +768,6 @@ function Update-AgentPlaceholders {
     }
 }
 
-function Convert-LocalPath {
-    param([string] $LocalPath)
-
-    foreach ($from in @($PathMap.Keys | Sort-Object { ([string] $_).Length } -Descending)) {
-        $prefix = ([string] $from).TrimEnd('\', '/')
-        if ($LocalPath.Equals($prefix, [StringComparison]::OrdinalIgnoreCase) -or
-            $LocalPath.StartsWith("$prefix\", [StringComparison]::OrdinalIgnoreCase) -or
-            $LocalPath.StartsWith("$prefix/", [StringComparison]::OrdinalIgnoreCase)) {
-            return ([string] $PathMap[$from]).TrimEnd('\', '/') + $LocalPath.Substring($prefix.Length)
-        }
-    }
-    return $LocalPath
-}
-
 function Add-ProjectResource {
     param([string] $ProjectId, [string] $ProjectTitle, $Resource)
 
@@ -799,9 +775,9 @@ function Add-ProjectResource {
     if (Get-Prop $Resource 'label') { $cliArgs += @('--label', $Resource.label) }
     $what = $Resource.type
     if ($Resource.type -eq 'local_directory') {
-        $localPath = Convert-LocalPath $Resource.local_path
+        $localPath = $Resource.local_path
         if (-not (Test-Path -LiteralPath $localPath)) {
-            Write-Warning "Project '$ProjectTitle': $localPath does not exist on this machine yet. Clone it there, or re-map it with -PathMap."
+            Write-Warning "Project '$ProjectTitle': $localPath does not exist on this machine yet. Clone the repository there."
         }
         $cliArgs += @('--local-path', $localPath, '--daemon-id', $script:LocalDaemonId)
         if (Get-Prop $Resource 'execution_mode') { $cliArgs += @('--execution-mode', $Resource.execution_mode) }
