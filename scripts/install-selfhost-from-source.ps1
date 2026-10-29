@@ -20,7 +20,9 @@
            MULTICA_WORKTREE_BRANCH_PREFIX=-WorktreeBranchPrefix), then runs
            `multica setup self-host` (login + daemon start), or restarts the daemon
            when the CLI is already signed in to this server,
-        6. with -AgentsSpec: picks (or creates) the workspace, waits for this machine's
+           On a fresh server, setup opens the web page to create the first workspace
+           and waits until it exists.
+        6. with -AgentsSpec: picks the workspace, waits for this machine's
            runtimes to register in it, and runs scripts\multica-agents.ps1 from the
            checkout to create the exported projects, agents, skills and autopilots there.
 
@@ -67,12 +69,6 @@
     Workspace (ID or slug) to import -AgentsSpec into. Defaults to the only
     workspace the account belongs to.
 
-.PARAMETER WorkspaceName
-    Create a workspace with this name when the account has none yet (fresh server).
-
-.PARAMETER WorkspaceSlug
-    Slug for -WorkspaceName. Defaults to the name in lower-case with dashes.
-
 .PARAMETER PauseAutopilots
     Passed to multica-agents.ps1: create imported autopilots paused, so they do not
     run on both the old and the new machine.
@@ -94,8 +90,9 @@
     .\install-selfhost-from-source.ps1
 
 .EXAMPLE
-    # Fresh server: install, create a workspace and recreate exported projects/agents:
-    .\install-selfhost-from-source.ps1 -WorktreeBranchPrefix JWU -AgentsSpec .\agents.json -WorkspaceName 'WiseTechGlobal' -WorkspaceSlug wtg
+    # Fresh server: install, create the workspace in the browser when setup asks,
+    # then recreate exported projects/agents in it:
+    .\install-selfhost-from-source.ps1 -WorktreeBranchPrefix JWU -AgentsSpec .\agents.json
 
 .EXAMPLE
     # Stop the stack (data is kept):
@@ -111,8 +108,6 @@ param(
     [switch] $Force,
     [string] $AgentsSpec,
     [string] $WorkspaceId,
-    [string] $WorkspaceName,
-    [string] $WorkspaceSlug,
     [switch] $PauseAutopilots,
     [string] $DevVerificationCode
 )
@@ -640,15 +635,7 @@ function Resolve-Workspace {
         $names = ($workspaces | ForEach-Object { "$($_.name) ($($_.slug))" }) -join ', '
         throw "This account has several workspaces; pass -WorkspaceId <id-or-slug>. Found: $names"
     }
-    if (-not $WorkspaceName) {
-        throw "This account has no workspace yet. Re-run with -WorkspaceName '<name>', or create one at http://localhost:$script:FrontendPort and re-run."
-    }
-
-    $slug = if ($WorkspaceSlug) { $WorkspaceSlug } else { ($WorkspaceName.ToLowerInvariant() -replace '[^a-z0-9]+', '-').Trim('-') }
-    Write-Step "Creating workspace '$WorkspaceName' ($slug)"
-    $created = ConvertFrom-Json (Get-Output $CliPath @('workspace', 'create', '--name', $WorkspaceName, '--slug', $slug, '--output', 'json') -ShowErrors)
-    Write-Ok "Workspace created ($($created.id))"
-    return $created.id
+    throw "This account has no workspace yet. Create one at http://localhost:$script:FrontendPort/workspaces/new and re-run."
 }
 
 # The daemon registers runtimes per workspace; a workspace created a moment ago may

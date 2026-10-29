@@ -94,8 +94,7 @@ run the commands below from that folder; they download the installer next to the
 $url = 'https://raw.githubusercontent.com/jeffwu-tech/multica/feat/shared-issue-worktree/scripts/install-selfhost-from-source.ps1'
 Invoke-WebRequest $url -OutFile .\install-selfhost-from-source.ps1
 powershell -ExecutionPolicy Bypass -File .\install-selfhost-from-source.ps1 `
-    -WorktreeBranchPrefix <PREFIX> -DevVerificationCode <6-digit code> -AgentsSpec .\agents.json `
-    -WorkspaceName '<Workspace Name>' -WorkspaceSlug <workspace-slug>
+    -WorktreeBranchPrefix <PREFIX> -DevVerificationCode <6-digit code> -AgentsSpec .\agents.json
 ```
 
 The installer:
@@ -108,8 +107,9 @@ The installer:
 3. Builds the backend and web images from the checkout and starts the Docker Compose stack.
 4. Builds `multica.exe` inside Docker (no local Go needed) and installs it to `%USERPROFILE%\.multica\bin`.
 5. Sets `MULTICA_WORKTREE_SHARE_PER_ISSUE=true` and `MULTICA_WORKTREE_BRANCH_PREFIX=<PREFIX>` as user
-   environment variables, then runs `multica setup self-host` to sign in and start the daemon.
-6. With `-AgentsSpec`: picks or creates the workspace, waits for this machine's runtimes, and runs
+   environment variables, then runs `multica setup self-host` to sign in and start the daemon. On a
+   fresh server, setup opens the web page to create the first workspace and waits until you do.
+6. With `-AgentsSpec`: picks the workspace, waits for this machine's runtimes, and runs
    `scripts\multica-agents.ps1` from the checkout. `agents.secrets.json` is picked up automatically
    from the same folder.
 
@@ -117,7 +117,6 @@ The installer:
 | --- | --- |
 | `-WorktreeBranchPrefix` | Prefix for shared issue branches, e.g. `JWU` gives `JWU/<work item>`. Required on the first install; reused afterwards. |
 | `-AgentsSpec` | Export file to import. |
-| `-WorkspaceName`, `-WorkspaceSlug` | Workspace to create when the account has none yet. |
 | `-WorkspaceId` | Workspace (ID or slug) to import into when the account has several. |
 | `-PauseAutopilots` | Create autopilots paused, so they do not run on both machines during the move. |
 | `-DevVerificationCode` | Fixed 6-digit login code (sets `APP_ENV=development`). Only for servers nobody else can reach. |
