@@ -426,6 +426,11 @@ function Initialize-EnvFile {
     $envPath = Join-Path $InstallDir '.env'
     $settings = Get-EnvSettings
     if (Test-Path $envPath) {
+        # Compose refuses to start without JWT_SECRET (e.g. a .env copied from
+        # .env.example). A set value is kept: replacing it signs everyone out.
+        if ([System.IO.File]::ReadAllText($envPath) -notmatch '(?m)^JWT_SECRET=\S') {
+            $settings['JWT_SECRET'] = New-RandomHex 32
+        }
         if ($settings.Count -gt 0) {
             Set-EnvFileValues $envPath $settings
             Write-Ok "Updated existing .env: $($settings.Keys -join ', ')"
