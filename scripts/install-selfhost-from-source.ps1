@@ -312,8 +312,14 @@ function Test-BaseImages {
 
     Write-Step "Checking base images: $($images -join ', ')"
     foreach ($image in $images) {
-        if ($null -ne (Get-Output 'docker' @('image', 'inspect', $image) -AllowFailure)) { continue }
-        if ((Invoke-Step 'docker' @('pull', '--quiet', $image) -AllowFailure) -ne 0) {
+        if ($null -ne (Get-Output 'docker' @('image', 'inspect', $image) -AllowFailure)) {
+            Write-Host "    $image (cached)"
+            continue
+        }
+        # Progress is shown on purpose: a first pull is several hundred MB, and a
+        # silent pull is indistinguishable from one stalled on an unreachable registry.
+        Write-Host "    Pulling $image ..."
+        if ((Invoke-Step 'docker' @('pull', $image) -AllowFailure) -ne 0) {
             throw ("Docker could not pull '$image'. If this network needs a proxy, set it in Docker Desktop " +
                 '(Settings > Resources > Proxies), or pre-load the image with `docker load`, then re-run.')
         }
