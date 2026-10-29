@@ -148,6 +148,19 @@ function Invoke-Step {
     return $code
 }
 
+# Runs a native command on this console instead of through the pipeline. Docker
+# draws progress bars only when its output is a console; piped, it prints one
+# text line per layer update. Returns the exit code.
+function Invoke-OnConsole {
+    param([string] $FilePath, [string[]] $Arguments)
+    $exe = (Get-Command $FilePath -CommandType Application | Select-Object -First 1).Source
+    $process = Start-Process -FilePath $exe -ArgumentList $Arguments -NoNewWindow -PassThru
+    # Touching Handle keeps ExitCode readable after exit on Windows PowerShell.
+    $null = $process.Handle
+    $process.WaitForExit()
+    return $process.ExitCode
+}
+
 # Runs a native command and returns its trimmed stdout (stderr discarded unless -ShowErrors).
 function Get-Output {
     param([string] $FilePath, [string[]] $Arguments, [switch] $AllowFailure, [switch] $ShowErrors)
@@ -319,7 +332,7 @@ function Test-BaseImages {
         # Progress is shown on purpose: a first pull is several hundred MB, and a
         # silent pull is indistinguishable from one stalled on an unreachable registry.
         Write-Host "    Pulling $image ..."
-        if ((Invoke-Step 'docker' @('pull', $image) -AllowFailure) -ne 0) {
+        if ((Invoke-OnConsole 'docker' @('pull', $image)) -ne 0) {
             throw ("Docker could not pull '$image'. If this network needs a proxy, set it in Docker Desktop " +
                 '(Settings > Resources > Proxies), or pre-load the image with `docker load`, then re-run.')
         }
