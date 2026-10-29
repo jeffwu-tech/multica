@@ -50,6 +50,99 @@ back for review. Self-hostable, works with the agent CLIs you already use, no lo
 
 ---
 
+## About this branch: self-host from source and migrate agents
+
+This branch (`feat/shared-issue-worktree`) adds daemon changes that the official release images
+and CLI do not have, such as one shared worktree per issue in `local_directory` worktree mode.
+To run them, build every component from this branch with two Windows scripts:
+
+| Script | Purpose |
+| --- | --- |
+| [`scripts/multica-agents.ps1`](scripts/multica-agents.ps1) | Export a workspace's projects, agents, skills and autopilots to JSON, and re-create them in another workspace. |
+| [`scripts/install-selfhost-from-source.ps1`](scripts/install-selfhost-from-source.ps1) | Clone this branch, build the server, web app and `multica.exe`, start them, sign in, and import an export. |
+
+### 1. Export from the old machine
+
+```powershell
+pwsh .\scripts\multica-agents.ps1 -Export -Path .\agents.json -IncludeSecrets
+```
+
+Add `-MulticaProfile <name>` if your CLI uses a named profile. This writes:
+
+- `agents.json`: projects, agents (with avatars), skills and autopilots. Workspace IDs inside
+  instructions and prompts become name placeholders such as `{{agent:<name>}}`, which are replaced
+  with the new IDs on import.
+- `agents.secrets.json`: each agent's custom environment variables and MCP config. Keep it
+  private, never commit it, and delete it after the migration.
+
+The built-in Mika agent is not exported; the new workspace creates its own.
+
+### 2. Prepare the new machine
+
+- 64-bit Windows with Docker Desktop running (`docker compose` v2) and network access to Docker Hub.
+- Git, and PowerShell 7 (`winget install --id Microsoft.PowerShell`) for the import step.
+- The agent CLIs your agents use (Claude Code, Codex, Copilot, ...), installed and signed in.
+- The repositories that your projects' local directories point to, cloned at the same paths.
+
+### 3. Install and import
+
+Copy `agents.json` and `agents.secrets.json` from step 1 to the new machine over a private channel
+(not through this public repository). Put them in one folder, for example `C:\multica-migrate`, and
+run the commands below from that folder; they download the installer next to the two files:
+
+```powershell
+$url = 'https://raw.githubusercontent.com/jeffwu-tech/multica/feat/shared-issue-worktree/scripts/install-selfhost-from-source.ps1'
+Invoke-WebRequest $url -OutFile .\install-selfhost-from-source.ps1
+powershell -ExecutionPolicy Bypass -File .\install-selfhost-from-source.ps1 `
+    -WorktreeBranchPrefix <PREFIX> -DevVerificationCode <6-digit code> -AgentsSpec .\agents.json `
+    -WorkspaceName '<Workspace Name>' -WorkspaceSlug <workspace-slug>
+```
+
+The installer:
+
+1. Clones this branch into `C:\git\GitHub\multica`. An existing checkout is reused: it fetches from
+   the remote that points at this fork (adding a `fork` remote if needed) and refuses to discard
+   local changes or unpushed commits unless you pass `-Force`.
+2. Creates `.env` with random secrets and telemetry turned off. With `-DevVerificationCode`, it also
+   sets a fixed login code, so step 5 signs in with that code instead of one read from the backend log.
+3. Builds the backend and web images from the checkout and starts the Docker Compose stack.
+4. Builds `multica.exe` inside Docker (no local Go needed) and installs it to `%USERPROFILE%\.multica\bin`.
+5. Sets `MULTICA_WORKTREE_SHARE_PER_ISSUE=true` and `MULTICA_WORKTREE_BRANCH_PREFIX=<PREFIX>` as user
+   environment variables, then runs `multica setup self-host` to sign in and start the daemon.
+6. With `-AgentsSpec`: picks or creates the workspace, waits for this machine's runtimes, and runs
+   `scripts\multica-agents.ps1` from the checkout. `agents.secrets.json` is picked up automatically
+   from the same folder.
+
+| Parameter | Meaning |
+| --- | --- |
+| `-WorktreeBranchPrefix` | Prefix for shared issue branches, e.g. `JWU` gives `JWU/<work item>`. Required on the first install; reused afterwards. |
+| `-AgentsSpec` | Export file to import. |
+| `-WorkspaceName`, `-WorkspaceSlug` | Workspace to create when the account has none yet. |
+| `-WorkspaceId` | Workspace (ID or slug) to import into when the account has several. |
+| `-PauseAutopilots` | Create autopilots paused, so they do not run on both machines during the move. |
+| `-DevVerificationCode` | Fixed 6-digit login code (sets `APP_ENV=development`). Only for servers nobody else can reach. |
+| `-RepoUrl`, `-Branch`, `-InstallDir` | Build from a different fork, branch or folder. |
+| `-SkipSetup` | Skip sign-in, daemon start and import. |
+| `-Force` | Discard local changes or unpushed commits in the checkout. |
+
+Both scripts are safe to re-run: existing projects, agents, skills and autopilots are skipped.
+Preview an import with `pwsh .\scripts\multica-agents.ps1 -Path .\agents.json -WhatIf`.
+
+Not migrated: issues, run history, chat sessions, member or team invocation permissions,
+Composio allow-lists, project priority and workflows, and webhook trigger URLs (webhook triggers
+get a new URL). Projects keep their exported local paths, so clone each repository to the same
+path on the new machine; the import warns about any path that does not exist yet.
+
+### Update, logs and stop
+
+- **Update:** re-run the installer; it pulls the branch, rebuilds and restarts everything. Data stays in the Docker volume.
+- **Logs:** `docker compose -f docker-compose.selfhost.yml -f docker-compose.selfhost.build.yml logs -f backend`, from `C:\git\GitHub\multica`.
+- **Stop:** the same command with `down`; data is kept.
+- **Daemon:** use the standalone `multica daemon start | stop | status`. Multica Desktop runs its own
+  bundled CLI, which does not include this branch's daemon changes.
+
+---
+
 ## What is Multica?
 
 You already run Claude Code, Codex, and three other agents. Each one lives in its own terminal
